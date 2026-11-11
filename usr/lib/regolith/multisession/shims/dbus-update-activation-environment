@@ -1,0 +1,11 @@
+#!/bin/sh
+# regolith-multisession shim, on PATH in standalone sessions only: update the
+# session's private bus, never the user manager (--systemd is dropped).
+. "${0%/*}/_common.sh"
+ms_real_path
+for arg do
+    shift
+    [ "$arg" = --systemd ] && continue
+    set -- "$@" "$arg"
+done
+exec dbus-update-activation-environment "$@"

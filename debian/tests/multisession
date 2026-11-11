@@ -1,0 +1,14 @@
+#!/bin/sh
+# regolith-multisession: entries, the primary/standalone decision, the
+# Xsession hook, the component and autostart planner, the shims, and two
+# standalone sessions with i3 on Xvfb (private buses, bridged dconf, session
+# manager, logout, teardown). See multisession.bash.
+set -eu
+here=$(dirname "$0")
+# A session component that only exists as a systemd user unit, as the gsd
+# plugins do on Ubuntu 26.04
+mkdir -p /usr/local/lib/systemd/user
+printf '[Service]\nExecStart=-/usr/libexec/comp-unit --flag %%h\n' \
+    > /usr/local/lib/systemd/user/comp-unit.service
+trap 'rm -f /usr/local/lib/systemd/user/comp-unit.service' EXIT
+"$here/multisession-as-user" "$here/multisession.bash"

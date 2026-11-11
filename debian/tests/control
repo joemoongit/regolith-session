@@ -191,3 +191,35 @@ Tests: bar-blocks
 Depends: regolith-session-flashback,
          i3status-rs
 Restrictions: allow-stderr, skippable, skip-not-installable
+
+Tests: multisession
+Depends: regolith-session-multisession,
+         dbus,
+         dconf-cli,
+         dconf-gsettings-backend,
+         dconf-service,
+         desktop-file-utils,
+         gsettings-desktop-schemas,
+         i3-wm,
+         libglib2.0-bin,
+         procps,
+         x11-utils,
+         xvfb
+Restrictions: needs-root, allow-stderr
+
+Tests: multisession-regolith
+Depends: regolith-session-multisession,
+         regolith-look-default,
+         regolith-compositor-picom-glx,
+         regolith-i3-compositor,
+         gnome-settings-daemon,
+         dbus,
+         dconf-gsettings-backend,
+         dconf-service,
+         gsettings-desktop-schemas,
+         libglib2.0-bin,
+         procps,
+         x11-utils,
+         x11-xserver-utils,
+         xvfb
+Restrictions: needs-root, allow-stderr

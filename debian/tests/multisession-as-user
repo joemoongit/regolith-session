@@ -1,0 +1,30 @@
+#!/bin/sh
+# Run a regolith-multisession test script as a throwaway unprivileged user,
+# with a home and a runtime directory as a login would give it (there is no
+# logind in the testbed). Needs root. Usage: multisession-as-user <script>
+set -eu
+user=regolith-ms-test
+dir=$(mktemp -d)
+chmod 755 "$dir"
+install -m 755 "$1" "$dir/test"
+
+userdel -r "$user" >/dev/null 2>&1 || true
+useradd -m -s /bin/bash "$user"
+uid=$(id -u "$user")
+install -d -m 700 -o "$user" "/run/user/$uid"
+# shellcheck disable=SC2329 # run by the EXIT trap
+cleanup() {
+    pkill -KILL -u "$user" 2>/dev/null || true
+    sleep 0.5
+    userdel -r "$user" >/dev/null 2>&1 || true
+    rm -rf "/run/user/$uid" "$dir"
+}
+trap cleanup EXIT
+
+rc=0
+runuser -u "$user" -- env -i \
+    PATH=/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin LANG=C.UTF-8 \
+    HOME="$(getent passwd "$user" | cut -d: -f6)" USER="$user" LOGNAME="$user" \
+    XDG_RUNTIME_DIR="/run/user/$uid" \
+    bash "$dir/test" || rc=$?
+exit $rc

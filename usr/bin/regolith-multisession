@@ -1,0 +1,500 @@
+#!/bin/bash
+# regolith-multisession: any number of concurrent graphical sessions, on any
+# number of VTs, for any number of users, including several sessions of the
+# same user.
+#
+# A user's first graphical session runs the stock session (for Regolith:
+# gnome-session on the systemd user manager). Every further session of that
+# user runs "standalone": its own private D-Bus bus, its own session
+# components, per-user services bridged to the user bus, and no writes to the
+# user manager that the first session owns. See
+# /usr/share/doc/regolith-session-multisession/multisession.md.
+set -Eeuo pipefail
+
+MS_VERSION=1.0.0
+MS_BIN=$(readlink -f "${BASH_SOURCE[0]}")
+MS_PREFIX=${MULTISESSION_PREFIX:-$(dirname "$(dirname "$MS_BIN")")}
+MS_LIBDIR=$MS_PREFIX/lib/regolith/multisession
+MS_SHIMDIR=$MS_LIBDIR/shims
+MS_AGENT=$MS_LIBDIR/msagent
+MS_SYSCONF=${MULTISESSION_SYSCONF:-/etc/regolith/multisession}
+MS_KEY_SUFFIX=-multisession   # session key (.desktop name) of a multi-session entry: <session>-multisession
+MS_USER=$(id -un)
+
+# ---- configuration (overridden by multisession.conf) -----------------------
+ISOLATE=auto
+NAME_SUFFIX=" (multi-session)"
+XSESSION_DIRS=(/usr/share/xsessions /usr/local/share/xsessions)
+BRIDGE_NAMES=(ca.desrt.dconf org.freedesktop.secrets
+              org.freedesktop.impl.portal.PermissionStore org.freedesktop.portal.Documents)
+AUTOSTART_SKIP=(localsearch-3 org.gnome.Evolution-alarm-notify)
+DISPLAY_SCOPED_PROCESSES=(picom compton xcompmgr)
+LATE_AUTOSTART_DELAY=1
+
+# ---- helpers -----------------------------------------------------------------
+log() {
+    printf 'regolith-multisession: %s\n' "$*" >&2
+    if command -v logger >/dev/null 2>&1; then logger -t regolith-multisession -- "$*" || :; fi
+}
+die() { log "error: $*"; exit 1; }
+
+user_config_dir() { printf '%s\n' "${XDG_CONFIG_HOME:-${HOME:-/nonexistent}/.config}/regolith3/multisession"; }
+
+# Source a configuration file. A mistake in it is logged, but it must not
+# keep the user from logging in.
+source_config() {
+    [[ -r $1 ]] || return 0
+    set +Eeu
+    # shellcheck source=/dev/null
+    source "$1" || log "error in $1 (ignored)"
+    set -Eeu
+}
+
+load_config() {
+    source_config "$MS_SYSCONF/multisession.conf"
+    source_config "$(user_config_dir)/multisession.conf"
+}
+
+# Profile of a session: how to run it standalone. Without a profile, a
+# standalone session is the stock Exec on a private bus (what
+# 'startx + dbus-run-session' does), which suits sessions without a
+# session manager that insists on systemd.
+load_profile() {
+    GNOME_SESSION="" WM_COMPONENT="" WM_EXEC="" XDG_CONFIG_PREFIX="" AUTOSTART=true
+    COMPONENTS_SKIP=()
+    unset -f standalone_setup 2>/dev/null || :
+    source_config "$MS_SYSCONF/profiles/$1.conf"
+    source_config "$(user_config_dir)/profiles/$1.conf"
+}
+
+find_desktop() { # <name> <dir>... → path of <name>.desktop in the first dir that has it
+    local name=$1 d; shift
+    for d in "$@"; do
+        if [[ -r $d/$name.desktop ]]; then printf '%s\n' "$d/$name.desktop"; return 0; fi
+    done
+    return 1
+}
+
+desktop_get() { # <file> <key> → value of <key> in [Desktop Entry]
+    awk -v key="$2" '
+        /^\[/ { in_entry = ($0 == "[Desktop Entry]"); next }
+        in_entry && index($0, key "=") == 1 { print substr($0, length(key) + 2); exit }
+    ' "$1"
+}
+
+desktop_exec() { # <file> → Exec without field codes
+    local exec_line
+    exec_line=$(desktop_get "$1" Exec)
+    [[ -n $exec_line ]] || return 1
+    sed -E 's/(^| )%[fFuUdDnNickvm]( |$)/\1\2/g; s/%%/%/g' <<<"$exec_line"
+}
+
+app_dirs() {
+    local IFS=: d
+    for d in "${XDG_DATA_HOME:-${HOME:-/nonexistent}/.local/share}" ${XDG_DATA_DIRS:-/usr/local/share:/usr/share}; do
+        printf '%s\n' "$d/applications"
+    done
+}
+
+# Live graphical logind sessions of this user, other than this one.
+other_graphical_sessions() {
+    command -v loginctl >/dev/null 2>&1 || return 0
+    local id props
+    while read -r id _; do
+        [[ -n $id && $id != "${XDG_SESSION_ID:-}" ]] || continue
+        props=$(loginctl show-session "$id" -p Name -p Class -p Type -p State 2>/dev/null) || continue
+        grep -qxF "Name=$MS_USER" <<<"$props" || continue
+        grep -qx 'Class=user' <<<"$props" || continue
+        grep -qE '^Type=(x11|wayland|mir)$' <<<"$props" || continue
+        grep -qE '^State=(active|online)$' <<<"$props" || continue
+        printf '%s\n' "$id"
+    done < <(loginctl list-sessions --no-legend 2>/dev/null)
+}
+
+# Graphical sessions of this user that use the user manager and user bus:
+# all of them except standalone multisession sessions, which keep to their
+# own bus.
+sessions_on_user_manager() {
+    local id
+    for id in $(other_graphical_sessions); do
+        grep -qx 'mode=standalone' "${XDG_RUNTIME_DIR:-/nonexistent}/multisession/$id/state" 2>/dev/null \
+            || printf '%s\n' "$id"
+    done
+}
+
+# Whether this session must run standalone: when another session of the user
+# holds the user manager. Once that session ends, the next login gets the
+# stock session again, even while standalone ones still run. Decided once:
+# the Xsession.d hook decides early and passes the answer on in
+# MULTISESSION_ISOLATE.
+should_isolate() {
+    case ${MULTISESSION_ISOLATE:-} in 1) return 0 ;; 0) return 1 ;; esac
+    case $ISOLATE in
+        always) return 0 ;;
+        never) return 1 ;;
+        auto)
+            [[ -z $(sessions_on_user_manager) ]] || return 0
+            # What gnome-session checks: the user manager runs a graphical session (or its remains)
+            if MULTISESSION_SHIM_BYPASS=1 systemctl --user is-active --quiet graphical-session.target 2>/dev/null; then return 0; fi
+            return 1 ;;
+        *) die "ISOLATE='$ISOLATE' is not one of auto, always, never" ;;
+    esac
+}
+
+# The display manager names the session after the multi-session entry. Give
+# the session the names and directories it would get from its own entry.
+restore_session_identity() {
+    local name=$1 key=$1$MS_KEY_SUFFIX var
+    for var in DESKTOP_SESSION XDG_SESSION_DESKTOP GDMSESSION; do
+        if [[ ${!var:-} == "$key" ]]; then export "$var=$name"; fi
+    done
+    for var in XDG_CONFIG_DIRS XDG_DATA_DIRS; do
+        if [[ ${!var:-} == *"$key"* ]]; then export "$var=${!var//$key/$name}"; fi
+    done
+}
+
+prepend_path_var() { # <var> <dir>
+    case ":${!1:-}:" in
+        *":$2:"*) ;;
+        *) export "$1=$2${!1:+:${!1}}" ;;
+    esac
+}
+
+run_hooks() {
+    local dir hook
+    for dir in "$MS_SYSCONF/hooks.d" "$(user_config_dir)/hooks.d"; do
+        for hook in "$dir"/*.sh; do
+            [[ -r $hook ]] || continue
+            # A broken hook must not keep the user from logging in
+            set +Eeu
+            # shellcheck source=/dev/null
+            source "$hook" || log "hook $hook failed (ignored)"
+            set -Eeu
+        done
+    done
+}
+
+session_rundir() { printf '%s\n' "${XDG_RUNTIME_DIR:-/tmp}/multisession/${XDG_SESSION_ID:-pid$$}"; }
+
+user_bus_path() { printf '%s\n' "${XDG_RUNTIME_DIR:-/nonexistent}/bus"; }
+
+# The private bus: the system's session bus configuration, with this
+# session's service files first, so they win over the system's files that
+# own the same names (dconf, secrets, ...).
+prepare_private_bus() {
+    local dir=$MULTISESSION_RUNDIR/dbus-services name system_conf
+    mkdir -p "$dir"
+    rm -f "$dir"/*.service
+    if [[ -x $MS_AGENT ]] && "$MS_AGENT" check >/dev/null 2>&1; then
+        write_service "$dir" org.gnome.SessionManager session-manager
+        if [[ -S $(user_bus_path) ]]; then
+            for name in "${BRIDGE_NAMES[@]}"; do write_service "$dir" "$name" bridge "$name"; done
+        else
+            log "no user bus at $(user_bus_path): per-user services are not bridged"
+        fi
+    else
+        log "msagent unusable (python3-gi missing?): no bridges, no session manager"
+    fi
+    system_conf=/usr/share/dbus-1/session.conf
+    [[ -r $system_conf ]] || system_conf=/etc/dbus-1/session.conf
+    cat >"$MULTISESSION_RUNDIR/bus.conf" <<EOF
+<!DOCTYPE busconfig PUBLIC "-//freedesktop//DTD D-Bus Bus Configuration 1.0//EN"
+ "http://www.freedesktop.org/standards/dbus/1.0/busconfig.dtd">
+<!-- Generated by regolith-multisession for session ${XDG_SESSION_ID:-?}. -->
+<busconfig>
+  <servicedir>$dir</servicedir>
+  <include>$system_conf</include>
+</busconfig>
+EOF
+}
+
+write_service() { # <dir> <bus name> <msagent args...>
+    local dir=$1 name=$2; shift 2
+    printf '[D-BUS Service]\nName=%s\nExec=%s %s\n' "$name" "$MS_AGENT" "$*" >"$dir/$name.service"
+}
+
+write_state() {
+    mkdir -p "$MULTISESSION_RUNDIR"
+    {
+        printf 'session=%s\n' "$MULTISESSION_SESSION"
+        printf 'mode=%s\n' "$MULTISESSION_MODE"
+        printf 'instance=%s\n' "$MULTISESSION_INSTANCE"
+        printf 'display=%s\n' "${DISPLAY:-}"
+        printf 'vt=%s\n' "${XDG_VTNR:-}"
+        printf 'leader=%s\n' "$$"
+    } >"$MULTISESSION_RUNDIR/state"
+}
+
+# ---- commands ----------------------------------------------------------------
+
+# regolith-multisession new [--seat SeatN]: ask LightDM for one more greeter. LightDM
+# opens it on the next free VT; log in there for another session. Works from
+# a text console (Ctrl+Alt+F2) and from inside a graphical session. Restarting
+# LightDM instead would end every session it runs.
+cmd_new() {
+    local seat=""
+    while (($#)); do
+        case $1 in
+            --seat) seat=${2:?--seat needs a seat name}; shift 2 ;;
+            -h|--help) usage; return 0 ;;
+            *) die "new: unknown option $1" ;;
+        esac
+    done
+    command -v dm-tool >/dev/null 2>&1 || die "dm-tool not found; is LightDM installed?"
+    if [[ -z $seat ]]; then
+        seat=$(dm-tool list-seats 2>/dev/null | awk '/^[^ \t]/ { print; exit }') || :
+        [[ -n $seat ]] || die "LightDM runs no seat. Start it once with: sudo systemctl start lightdm"
+    fi
+    seat=${seat##*/}
+    log "asking LightDM for a new greeter on $seat"
+    XDG_SEAT_PATH=/org/freedesktop/DisplayManager/$seat dm-tool switch-to-greeter
+}
+
+# regolith-multisession launch <session>: the Exec of a multi-session entry.
+cmd_launch() {
+    local name=${1:?usage: regolith-multisession launch <session>} desktop instances
+    load_config
+    load_profile "$name"
+    restore_session_identity "$name"
+    desktop=$(find_desktop "$name" "${XSESSION_DIRS[@]}") || die "no session '$name' in ${XSESSION_DIRS[*]}"
+
+    local mode=primary
+    if should_isolate; then mode=standalone; fi
+    instances=$(other_graphical_sessions | wc -l)
+    export MULTISESSION_SESSION=$name MULTISESSION_MODE=$mode
+    export MULTISESSION_INSTANCE=$((instances + 1)) MULTISESSION_RUNDIR
+    MULTISESSION_RUNDIR=$(session_rundir)
+    write_state
+    run_hooks
+    log "starting $name as $mode session (instance $MULTISESSION_INSTANCE) on ${DISPLAY:-?}, vt ${XDG_VTNR:-?}"
+
+    if [[ $mode == primary ]]; then
+        local exec_line
+        exec_line=$(desktop_exec "$desktop") || die "$desktop has no Exec"
+        exec sh -c "exec $exec_line"
+    fi
+
+    command -v dbus-run-session >/dev/null 2>&1 || die "dbus-run-session not found (package dbus-bin)"
+    prepare_private_bus
+    MULTISESSION_USER_BUS="unix:path=$(user_bus_path)"
+    export MULTISESSION_USER_BUS
+    unset DBUS_SESSION_BUS_ADDRESS
+    # setsid: the session gets its own process group, so ending it ends
+    # everything it started. The runtime directory holds the bus's
+    # configuration, so it goes once the bus is gone.
+    local rc=0
+    dbus-run-session --config-file="$MULTISESSION_RUNDIR/bus.conf" -- \
+        setsid --wait "$MS_BIN" _standalone "$name" || rc=$?
+    rm -rf "${MULTISESSION_RUNDIR:?}"
+    exit "$rc"
+}
+
+# The standalone session, on its private bus.
+cmd__standalone() {
+    local name=${1:?} desktop wm_cmd="" phase cmd plan=""
+    local -a late=()
+    load_config
+    load_profile "$name"
+    export MULTISESSION_LEADER_PID=$$ MULTISESSION_SHIM_DIR=$MS_SHIMDIR
+    export MULTISESSION_DISPLAY_SCOPED="${DISPLAY_SCOPED_PROCESSES[*]}"
+    prepend_path_var PATH "$MS_SHIMDIR"
+    if [[ -n $XDG_CONFIG_PREFIX ]]; then
+        export XDG_CONFIG_DIRS=${XDG_CONFIG_DIRS:-/etc/xdg}   # the spec's default, kept behind the prefix
+        prepend_path_var XDG_CONFIG_DIRS "$XDG_CONFIG_PREFIX"
+    fi
+    if declare -F standalone_setup >/dev/null; then standalone_setup; fi
+
+    # The window manager: the profile's, else the stock Exec
+    if [[ -n $WM_EXEC ]]; then
+        wm_cmd=$WM_EXEC
+    elif [[ -n $WM_COMPONENT ]]; then
+        local -a dirs
+        mapfile -t dirs < <(app_dirs)
+        desktop=$(find_desktop "$WM_COMPONENT" "${dirs[@]}") || die "no $WM_COMPONENT.desktop in ${dirs[*]}"
+        wm_cmd=$(desktop_exec "$desktop") || die "$desktop has no Exec"
+    else
+        desktop=$(find_desktop "$name" "${XSESSION_DIRS[@]}") || die "no session '$name'"
+        wm_cmd=$(desktop_exec "$desktop") || die "$desktop has no Exec"
+    fi
+
+    # Services activated on the private bus get this session's environment
+    # (the real binary: the shim on PATH would drop nothing here anyway)
+    command -p dbus-update-activation-environment --all 2>/dev/null \
+        || log "could not update the private bus's activation environment"
+
+    trap teardown EXIT
+    trap 'exit 0' TERM HUP INT
+
+    if [[ -n $GNOME_SESSION || $AUTOSTART == true ]] && [[ -x $MS_AGENT ]]; then
+        local -a plan_args=(plan --skip "$(IFS=,; echo "$WM_COMPONENT,${COMPONENTS_SKIP[*]},${AUTOSTART_SKIP[*]}")")
+        if [[ -n $GNOME_SESSION ]]; then plan_args+=(--gnome-session "$GNOME_SESSION"); fi
+        if [[ $AUTOSTART == true ]]; then plan_args+=(--autostart); fi
+        plan=$("$MS_AGENT" "${plan_args[@]}") || log "msagent plan failed; starting the window manager alone"
+    fi
+    while IFS=$'\t' read -r phase cmd; do
+        [[ -n ${cmd:-} ]] || continue
+        if [[ $phase == early ]]; then spawn "$cmd"; else late+=("$cmd"); fi
+    done <<<"$plan"
+
+    log "standalone $name: window manager: $wm_cmd"
+    sh -c "exec $wm_cmd" &
+    local wm_pid=$!
+    if ((${#late[@]})); then
+        sleep "$LATE_AUTOSTART_DELAY"
+        for cmd in "${late[@]}"; do spawn "$cmd"; done
+    fi
+    wait "$wm_pid"
+}
+
+spawn() {
+    log "starting: $1"
+    sh -c "exec $1" &
+}
+
+# End everything the standalone session started: it all shares our process
+# group, except what put itself into another session. Of those, the
+# per-display programs on this display (a compositor that daemonized) are
+# stopped too; other X clients end with the X server.
+teardown() {
+    trap '' TERM HUP INT EXIT
+    log "ending standalone ${MULTISESSION_SESSION:-session} on ${DISPLAY:-?}"
+    local name
+    for name in "${DISPLAY_SCOPED_PROCESSES[@]}"; do
+        "$MS_SHIMDIR/pkill" -u "$(id -u)" -x "$name" 2>/dev/null || :
+    done
+    kill -TERM -- "-$$" 2>/dev/null || :
+    local pid _
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        command -p pgrep -g "$$" | grep -qvx "$$" || break
+        sleep 0.2
+    done
+    for pid in $(command -p pgrep -g "$$" | grep -vx "$$"); do kill -KILL "$pid" 2>/dev/null || :; done
+}
+
+# regolith-multisession should-isolate: exit 0 when this login must run standalone.
+cmd_should_isolate() { load_config; should_isolate; }
+
+# regolith-multisession entry <session>: print a multi-session entry for an
+# installed session. The package ships the one for regolith-x11; for another
+# session, e.g. i3:
+#   regolith-multisession entry i3 | sudo tee /usr/share/xsessions/i3-multisession.desktop
+cmd_entry() {
+    local name=${1:?usage: regolith-multisession entry <session>} src
+    load_config
+    [[ $name != *"$MS_KEY_SUFFIX" ]] || die "$name is a multi-session entry already"
+    src=$(find_desktop "$name" "${XSESSION_DIRS[@]}") || die "no session '$name' in ${XSESSION_DIRS[*]}"
+    awk -v src="$src" -v suffix="$NAME_SUFFIX" -v exec_cmd="$MS_BIN launch $name" '
+        BEGIN { print "# Made by regolith-multisession entry from " src }
+        /^\[/ { in_entry = ($0 == "[Desktop Entry]"); print; next }
+        in_entry && /^Exec=/ { print "Exec=" exec_cmd; next }
+        in_entry && /^Name(\[[^]]*\])?=/ { print $0 suffix; next }
+        { print }
+    ' "$src"
+}
+
+# Multi-session entries installed: <session> per <session>-multisession.desktop
+multisession_entries() {
+    local d f
+    for d in "${XSESSION_DIRS[@]}"; do
+        for f in "$d"/*"$MS_KEY_SUFFIX".desktop; do
+            [[ -r $f ]] || continue
+            f=${f##*/}
+            printf '%s\n' "${f%"$MS_KEY_SUFFIX".desktop}"
+        done
+    done | sort -u
+}
+
+# regolith-multisession status: the graphical sessions on this machine.
+cmd_status() {
+    command -v loginctl >/dev/null 2>&1 || die "loginctl not found"
+    local id props uid state_file mode
+    printf '%-8s %-12s %-4s %-8s %-8s %-10s %s\n' SESSION USER VT TYPE STATE CLASS MULTISESSION
+    while read -r id uid _; do
+        [[ -n $id ]] || continue
+        props=$(loginctl show-session "$id" -p Name -p VTNr -p Type -p State -p Class 2>/dev/null) || continue
+        state_file=/run/user/$uid/multisession/$id/state
+        mode=-
+        if [[ -r $state_file ]]; then
+            mode=$(awk -F= '$1 == "session" { s = $2 } $1 == "mode" { m = $2 } $1 == "instance" { i = $2 }
+                            END { print s " " m " #" i }' "$state_file")
+        fi
+        printf '%-8s %-12s %-4s %-8s %-8s %-10s %s\n' "$id" \
+            "$(prop Name "$props")" "$(prop VTNr "$props")" "$(prop Type "$props")" \
+            "$(prop State "$props")" "$(prop Class "$props")" "$mode"
+    done < <(loginctl list-sessions --no-legend 2>/dev/null)
+}
+
+prop() { sed -n "s/^$1=//p" <<<"$2"; }
+
+# regolith-multisession doctor: check the installation and this user's sessions.
+cmd_doctor() {
+    load_config
+    local ok=0 name f
+    check() { # <description> <command...>
+        local what=$1; shift
+        if "$@" >/dev/null 2>&1; then printf '  ok    %s\n' "$what"; else printf '  FAIL  %s\n' "$what"; ok=1; fi
+    }
+    echo "LightDM"
+    check "lightdm is running" systemctl is-active --quiet lightdm
+    check "dm-tool lists a seat" sh -c 'dm-tool list-seats | grep -q "^Seat"'
+    check "the seat can switch (VT support)" sh -c 'dm-tool list-seats | grep -q "CanSwitch=true"'
+    echo "Sessions"
+    local entries
+    entries=$(multisession_entries)
+    check "a multi-session entry is installed" test -n "$entries"
+    for name in $entries; do
+        check "$name is installed" find_desktop "$name" "${XSESSION_DIRS[@]}"
+        check "profile for $name" test -r "$MS_SYSCONF/profiles/$name.conf"
+    done
+    echo "Standalone sessions"
+    check "dbus-run-session available" command -v dbus-run-session
+    check "setsid available" command -v setsid
+    check "msagent works (python3 with PyGObject)" "$MS_AGENT" check
+    check "user bus at $(user_bus_path) (bridges need it)" test -S "$(user_bus_path)"
+    if [[ -d /etc/X11/Xsession.d ]]; then
+        check "Xsession.d hook installed" test -r /etc/X11/Xsession.d/94regolith-multisession
+    fi
+    echo "This user ($MS_USER)"
+    printf '  info  other graphical sessions: %s\n' "$(other_graphical_sessions | tr '\n' ' ')"
+    printf '  info  graphical-session.target: %s\n' "$(MULTISESSION_SHIM_BYPASS=1 systemctl --user is-active graphical-session.target 2>/dev/null || :)"
+    printf '  info  a new login would run: %s\n' "$(if should_isolate; then echo standalone; else echo primary; fi)"
+    f=${HOME:-}/.xsession-errors
+    if [[ -r $f ]]; then
+        echo "Last multisession lines in $f"
+        grep -E 'multisession|msagent' "$f" | tail -n 15 | sed 's/^/  /' || :
+    fi
+    return $ok
+}
+
+usage() {
+    cat <<EOF
+regolith-multisession $MS_VERSION: concurrent graphical sessions, several per user
+
+  regolith-multisession new [--seat SeatN]  open one more LightDM greeter on the next free VT
+                                            (use this instead of restarting LightDM)
+  regolith-multisession status              list the graphical sessions and their mode
+  regolith-multisession doctor              check the installation and this user's sessions
+  regolith-multisession entry <session>     print a multi-session entry for another session
+  regolith-multisession launch <session>    entry point of the multi-session entries
+  regolith-multisession should-isolate      exit 0 if a new login of this user runs standalone
+EOF
+}
+
+main() {
+    local cmd=${1:-help}
+    shift || :
+    case $cmd in
+        new) cmd_new "$@" ;;
+        launch) cmd_launch "$@" ;;
+        _standalone) cmd__standalone "$@" ;;
+        should-isolate) cmd_should_isolate "$@" ;;
+        entry) cmd_entry "$@" ;;
+        status) cmd_status "$@" ;;
+        doctor) cmd_doctor "$@" ;;
+        version|--version) echo "$MS_VERSION" ;;
+        help|-h|--help) usage ;;
+        *) usage >&2; exit 2 ;;
+    esac
+}
+
+main "$@"

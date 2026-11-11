@@ -1,0 +1,6 @@
+#!/bin/sh
+# Two standalone Regolith X11 sessions of one user side by side, started by
+# the regolith-x11 multi-session entry. See multisession-regolith.bash.
+set -eu
+here=$(dirname "$0")
+"$here/multisession-as-user" "$here/multisession-regolith.bash"
