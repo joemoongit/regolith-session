@@ -1,0 +1,529 @@
+#!/usr/bin/python3
+"""regolith-multisession agent: the D-Bus side of a standalone session.
+
+  msagent bridge NAME      own NAME on the session's private bus and relay it
+                           to the single instance on the user bus
+  msagent session-manager  a minimal org.gnome.SessionManager for the session
+  msagent plan [...]       print the components and autostart entries to start
+  msagent check            exit 0 if this interpreter can run the agent
+
+The private bus activates 'bridge' and 'session-manager' from the service
+files that 'regolith-multisession launch' writes for each standalone session.
+"""
+
+import argparse
+import os
+import shlex
+import signal
+import sys
+import warnings
+
+import gi
+
+gi.require_version("Gio", "2.0")
+gi.require_version("GLib", "2.0")
+from gi.repository import Gio, GLib  # noqa: E402
+
+# Newer GLib moved DesktopAppInfo to GioUnix; older releases only have Gio's
+try:
+    gi.require_version("GioUnix", "2.0")
+    from gi.repository import GioUnix  # noqa: E402
+
+    DesktopAppInfo = GioUnix.DesktopAppInfo
+except (ValueError, ImportError):
+    DesktopAppInfo = Gio.DesktopAppInfo
+
+# The APIs used here work from Ubuntu 22.04 on; newer PyGObject marks some of
+# them deprecated
+warnings.simplefilter("ignore", DeprecationWarning)
+
+PROG = "msagent"
+
+
+def app_info(constructor, *args):
+    """A DesktopAppInfo, or None (PyGObject raises when the C constructor
+    returns NULL: no such entry, or TryExec failed)."""
+    try:
+        return constructor(*args)
+    except (TypeError, GLib.Error):
+        return None
+
+
+def log(msg):
+    print(f"{PROG}[{os.getpid()}]: {msg}", file=sys.stderr, flush=True)
+
+
+def private_bus():
+    """The standalone session's own bus (DBUS_SESSION_BUS_ADDRESS)."""
+    return Gio.bus_get_sync(Gio.BusType.SESSION, None)
+
+
+def user_bus():
+    """The user bus that the user's first session and the user manager use."""
+    address = os.environ.get("MULTISESSION_USER_BUS") or "unix:path=%s/bus" % os.environ["XDG_RUNTIME_DIR"]
+    flags = Gio.DBusConnectionFlags.AUTHENTICATION_CLIENT | Gio.DBusConnectionFlags.MESSAGE_BUS_CONNECTION
+    return Gio.DBusConnection.new_for_address_sync(address, flags, None, None)
+
+
+def run_until_closed(loop, *connections):
+    for conn in connections:
+        conn.set_exit_on_close(False)
+        conn.connect("closed", lambda *_: loop.quit())
+    GLib.unix_signal_add(GLib.PRIORITY_DEFAULT, signal.SIGTERM, lambda: loop.quit() or False)
+    loop.run()
+
+
+# ---- bridge ---------------------------------------------------------------------
+
+
+class Bridge:
+    """Relay a well-known name from the private bus to the user bus.
+
+    Some services hold per-user state and must exist once per user: a second
+    dconf-service on the same database loses writes, a second keyring or
+    document portal can't take the sockets and mounts the first one holds.
+    The bridge owns the name on the private bus, forwards every method call
+    to the name's owner on the user bus, sends the reply back, and re-emits
+    the owner's signals on the private bus.
+    """
+
+    def __init__(self, name):
+        self.name = name
+        self.loop = GLib.MainLoop()
+        self.inner = private_bus()
+        self.outer = user_bus()
+        self.signal_sub = None
+        self.inner.add_filter(self.on_inner_message)
+        Gio.bus_watch_name_on_connection(
+            self.outer, name, Gio.BusNameWatcherFlags.NONE, self.on_owner_appeared, self.on_owner_vanished
+        )
+        Gio.bus_own_name_on_connection(
+            self.inner, name, Gio.BusNameOwnerFlags.DO_NOT_QUEUE, self.on_acquired, self.on_lost
+        )
+
+    def run(self):
+        run_until_closed(self.loop, self.inner, self.outer)
+
+    def on_acquired(self, _conn, name):
+        log(f"bridging {name} to the user bus")
+
+    def on_lost(self, conn, name):
+        if conn is not None and not conn.is_closed():
+            log(f"could not own {name} on the private bus; exiting")
+        self.loop.quit()
+
+    def on_owner_appeared(self, _conn, _name, owner):
+        self.on_owner_vanished()
+        self.signal_sub = self.outer.signal_subscribe(
+            owner, None, None, None, None, Gio.DBusSignalFlags.NONE, self.on_outer_signal
+        )
+
+    def on_owner_vanished(self, *_args):
+        if self.signal_sub is not None:
+            self.outer.signal_unsubscribe(self.signal_sub)
+            self.signal_sub = None
+
+    def on_outer_signal(self, _conn, _sender, path, interface, member, params):
+        try:
+            self.inner.emit_signal(None, path, interface, member, params)
+        except GLib.Error as e:
+            log(f"could not relay signal {interface}.{member}: {e.message}")
+
+    # Runs in GDBus's worker thread: hand the call to the main loop
+    def on_inner_message(self, _conn, message, incoming):
+        if incoming and message.get_message_type() == Gio.DBusMessageType.METHOD_CALL:
+            GLib.idle_add(self.forward, message)
+            return None
+        return message
+
+    def forward(self, call):
+        out = call.copy()
+        out.set_destination(self.name)
+        out.set_sender(None)
+        if call.get_flags() & Gio.DBusMessageFlags.NO_REPLY_EXPECTED:
+            self.outer.send_message(out, Gio.DBusSendMessageFlags.NONE)
+        else:
+            # No timeout: a keyring unlock prompt can wait for the user
+            self.outer.send_message_with_reply(
+                out, Gio.DBusSendMessageFlags.NONE, GLib.MAXINT32, None, self.on_reply, call
+            )
+        return False
+
+    def on_reply(self, conn, result, call):
+        try:
+            back = conn.send_message_with_reply_finish(result).copy()
+            back.set_reply_serial(call.get_serial())
+        except GLib.Error as e:
+            back = Gio.DBusMessage.new_method_error_literal(call, "org.freedesktop.DBus.Error.NoReply", e.message)
+        back.set_destination(call.get_sender())
+        back.set_sender(None)
+        self.inner.send_message(back, Gio.DBusSendMessageFlags.NONE)
+
+
+# ---- session manager -------------------------------------------------------------
+
+SM_XML = """
+<node>
+  <interface name="org.gnome.SessionManager">
+    <method name="Logout"><arg type="u" name="mode" direction="in"/></method>
+    <method name="Shutdown"/>
+    <method name="Reboot"/>
+    <method name="CanShutdown"><arg type="b" direction="out"/></method>
+    <method name="IsSessionRunning"><arg type="b" direction="out"/></method>
+    <method name="Setenv">
+      <arg type="s" name="variable" direction="in"/><arg type="s" name="value" direction="in"/>
+    </method>
+    <method name="RegisterClient">
+      <arg type="s" name="app_id" direction="in"/><arg type="s" name="client_startup_id" direction="in"/>
+      <arg type="o" name="client_id" direction="out"/>
+    </method>
+    <method name="UnregisterClient"><arg type="o" name="client_id" direction="in"/></method>
+    <method name="Inhibit">
+      <arg type="s" name="app_id" direction="in"/><arg type="u" name="toplevel_xid" direction="in"/>
+      <arg type="s" name="reason" direction="in"/><arg type="u" name="flags" direction="in"/>
+      <arg type="u" name="inhibit_cookie" direction="out"/>
+    </method>
+    <method name="Uninhibit"><arg type="u" name="inhibit_cookie" direction="in"/></method>
+    <method name="IsInhibited">
+      <arg type="u" name="flags" direction="in"/><arg type="b" name="is_inhibited" direction="out"/>
+    </method>
+    <property name="SessionName" type="s" access="read"/>
+    <property name="SessionIsActive" type="b" access="read"/>
+    <property name="InhibitedActions" type="u" access="read"/>
+  </interface>
+</node>
+"""
+
+# GSM inhibit flags → logind inhibitor types
+INHIBIT_LOGIND = {4: "sleep", 8: "idle"}
+
+
+class SessionManager:
+    """Stands in for gnome-session, which can't run a second session of a
+    user. Logout ends this session only; shutdown and reboot go to logind;
+    inhibitors are kept here and taken from logind where it has one."""
+
+    PATH = "/org/gnome/SessionManager"
+
+    def __init__(self):
+        self.loop = GLib.MainLoop()
+        self.bus = private_bus()
+        self.system = None
+        self.inhibitors = {}  # cookie → (flags, [logind fds])
+        self.next_cookie = 1
+        self.next_client = 1
+        iface = Gio.DBusNodeInfo.new_for_xml(SM_XML).interfaces[0]
+        self.bus.register_object(self.PATH, iface, self.on_call, self.on_get_property, None)
+        Gio.bus_own_name_on_connection(
+            self.bus, "org.gnome.SessionManager", Gio.BusNameOwnerFlags.DO_NOT_QUEUE, None, self.on_lost
+        )
+
+    def run(self):
+        run_until_closed(self.loop, self.bus)
+
+    def on_lost(self, conn, _name):
+        if conn is not None and not conn.is_closed():
+            log("org.gnome.SessionManager is taken on this bus; exiting")
+        self.loop.quit()
+
+    def logind(self):
+        if self.system is None:
+            self.system = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+        return self.system
+
+    def logind_call(self, method, params, fd_out=False):
+        args = ("org.freedesktop.login1", "/org/freedesktop/login1", "org.freedesktop.login1.Manager", method, params)
+        if fd_out:
+            return self.logind().call_with_unix_fd_list_sync(
+                *args, None, Gio.DBusCallFlags.NONE, -1, None, None
+            )
+        return self.logind().call_sync(*args, None, Gio.DBusCallFlags.ALLOW_INTERACTIVE_AUTHORIZATION, -1, None)
+
+    def inhibited_actions(self):
+        flags = 0
+        for f, _fds in self.inhibitors.values():
+            flags |= f
+        return flags
+
+    def inhibitors_changed(self):
+        changed = {"InhibitedActions": GLib.Variant("u", self.inhibited_actions())}
+        self.bus.emit_signal(
+            None, self.PATH, "org.freedesktop.DBus.Properties", "PropertiesChanged",
+            GLib.Variant("(sa{sv}as)", ("org.gnome.SessionManager", changed, [])),
+        )
+
+    def on_get_property(self, _conn, _sender, _path, _iface, prop):
+        if prop == "SessionName":
+            return GLib.Variant("s", os.environ.get("MULTISESSION_SESSION", "multisession"))
+        if prop == "SessionIsActive":
+            return GLib.Variant("b", True)
+        if prop == "InhibitedActions":
+            return GLib.Variant("u", self.inhibited_actions())
+        return None
+
+    def on_call(self, _conn, sender, _path, _iface, method, params, invocation):
+        try:
+            invocation.return_value(getattr(self, "do_" + method)(sender, *params.unpack()))
+        except GLib.Error as e:
+            invocation.return_gerror(e)
+        except Exception as e:  # noqa: BLE001 - report any failure to the caller
+            invocation.return_dbus_error("org.gnome.SessionManager.Error.Failed", str(e))
+
+    def do_Logout(self, _sender, mode):
+        leader = int(os.environ.get("MULTISESSION_LEADER_PID", "0"))
+        log(f"logout (mode {mode}): ending session leader {leader}")
+        if leader > 1:
+            os.kill(leader, signal.SIGTERM)
+        return None
+
+    def do_Shutdown(self, _sender):
+        self.logind_call("PowerOff", GLib.Variant("(b)", (True,)))
+        return None
+
+    def do_Reboot(self, _sender):
+        self.logind_call("Reboot", GLib.Variant("(b)", (True,)))
+        return None
+
+    def do_CanShutdown(self, _sender):
+        return GLib.Variant("(b)", (True,))
+
+    def do_IsSessionRunning(self, _sender):
+        return GLib.Variant("(b)", (True,))
+
+    def do_Setenv(self, _sender, variable, value):
+        # What gnome-session does: later activated services get it
+        self.bus.call_sync(
+            "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus", "UpdateActivationEnvironment",
+            GLib.Variant("(a{ss})", ({variable: value},)), None, Gio.DBusCallFlags.NONE, -1, None,
+        )
+        return None
+
+    def do_RegisterClient(self, _sender, _app_id, _startup_id):
+        path = f"{self.PATH}/Client{self.next_client}"
+        self.next_client += 1
+        return GLib.Variant("(o)", (path,))
+
+    def do_UnregisterClient(self, _sender, _client):
+        return None
+
+    def do_Inhibit(self, _sender, app_id, _xid, reason, flags):
+        fds = []
+        for bit, what in INHIBIT_LOGIND.items():
+            if flags & bit:
+                try:
+                    _res, fd_list = self.logind_call(
+                        "Inhibit", GLib.Variant("(ssss)", (what, app_id or "unknown", reason, "block")), fd_out=True
+                    )
+                    fds.extend(fd_list.steal_fds())
+                except GLib.Error as e:
+                    log(f"logind refused a {what} inhibitor for {app_id}: {e.message}")
+        cookie = self.next_cookie
+        self.next_cookie += 1
+        self.inhibitors[cookie] = (flags, fds)
+        self.inhibitors_changed()
+        return GLib.Variant("(u)", (cookie,))
+
+    def do_Uninhibit(self, _sender, cookie):
+        _flags, fds = self.inhibitors.pop(cookie, (0, []))
+        for fd in fds:
+            os.close(fd)
+        self.inhibitors_changed()
+        return None
+
+    def do_IsInhibited(self, _sender, flags):
+        return GLib.Variant("(b)", (bool(self.inhibited_actions() & flags),))
+
+
+# ---- plan -----------------------------------------------------------------------
+
+FIELD_CODES = {"%f", "%F", "%u", "%U", "%d", "%D", "%n", "%N", "%i", "%c", "%k", "%v", "%m"}
+EARLY_PHASES = {"EarlyInitialization", "PreDisplayServer", "DisplayServer", "Initialization", "WindowManager"}
+SYSTEMD_USER_DIRS = ["/etc/systemd/user", "/usr/local/lib/systemd/user", "/usr/lib/systemd/user"]
+
+
+def config_dirs():
+    home = os.environ.get("XDG_CONFIG_HOME") or os.path.expanduser("~/.config")
+    return [home] + [d for d in os.environ.get("XDG_CONFIG_DIRS", "/etc/xdg").split(":") if d]
+
+
+def data_dirs():
+    home = os.environ.get("XDG_DATA_HOME") or os.path.expanduser("~/.local/share")
+    return [home] + [d for d in os.environ.get("XDG_DATA_DIRS", "/usr/local/share:/usr/share").split(":") if d]
+
+
+def exec_to_command(exec_line):
+    ok, argv = GLib.shell_parse_argv(exec_line)
+    argv = [a.replace("%%", "%") for a in argv if a not in FIELD_CODES]
+    return shlex.join(argv) if ok and argv else None
+
+
+def unit_exec_start(unit):
+    """ExecStart of a systemd user service, drop-ins included."""
+    files = []
+    for d in SYSTEMD_USER_DIRS:
+        if os.path.isfile(os.path.join(d, unit)):
+            files.append(os.path.join(d, unit))
+            break
+    for d in SYSTEMD_USER_DIRS:
+        dropins = os.path.join(d, unit + ".d")
+        if os.path.isdir(dropins):
+            files += sorted(os.path.join(dropins, f) for f in os.listdir(dropins) if f.endswith(".conf"))
+    exec_start = None
+    for path in files:
+        section = None
+        with open(path, encoding="utf-8", errors="replace") as fh:
+            for line in fh:
+                line = line.strip()
+                if line.startswith("["):
+                    section = line
+                elif section == "[Service]" and line.startswith("ExecStart="):
+                    exec_start = line[len("ExecStart="):].lstrip("-@:+!|") or None
+    if not exec_start:
+        return None
+    specifiers = {"%h": os.path.expanduser("~"), "%t": os.environ.get("XDG_RUNTIME_DIR", ""),
+                  "%U": str(os.getuid()), "%u": os.environ.get("USER", ""), "%%": "%"}
+    for spec, value in specifiers.items():
+        exec_start = exec_start.replace(spec, value)
+    return shlex.join(shlex.split(exec_start))
+
+
+def resolve_component(cid):
+    """The command for a gnome-session component: its desktop entry, as
+    gnome-session --builtin found it, else its systemd user service, which
+    is all that newer GNOME releases ship for some of them."""
+    info = app_info(DesktopAppInfo.new, cid + ".desktop")
+    if info is None:
+        for d in config_dirs():
+            path = os.path.join(d, "autostart", cid + ".desktop")
+            if os.path.isfile(path):
+                info = app_info(DesktopAppInfo.new_from_filename, path)
+                break
+    if info is not None and info.get_commandline():
+        return exec_to_command(info.get_commandline())
+    return unit_exec_start(cid + ".service")
+
+
+def session_components(name):
+    for d in config_dirs() + data_dirs():
+        path = os.path.join(d, "gnome-session", "sessions", name + ".session")
+        if os.path.isfile(path):
+            kf = GLib.KeyFile()
+            kf.load_from_file(path, GLib.KeyFileFlags.NONE)
+            return [c for c in kf.get_string_list("GNOME Session", "RequiredComponents") if c]
+    log(f"no {name}.session found")
+    return []
+
+
+def autostart_condition(condition):
+    """gnome-session's AutostartCondition, the kinds that matter on a desktop."""
+    kind, _, arg = condition.strip().partition(" ")
+    if kind == "GSettings":
+        schema_id, _, key = arg.strip().partition(" ")
+        source = Gio.SettingsSchemaSource.get_default()
+        schema = source.lookup(schema_id, True) if source else None
+        return bool(schema and schema.has_key(key) and Gio.Settings.new(schema_id).get_boolean(key))
+    config_home = config_dirs()[0]
+    if kind == "if-exists":
+        return os.path.exists(os.path.join(config_home, arg.strip()))
+    if kind == "unless-exists":
+        return not os.path.exists(os.path.join(config_home, arg.strip()))
+    if kind == "GNOME3":
+        test, _, session = arg.strip().partition(" ")
+        current = os.environ.get("XDG_SESSION_DESKTOP", "")
+        return (current == session) == (test == "if-session")
+    return True
+
+
+def shown_in_current_desktop(only_show_in, not_show_in):
+    """OnlyShowIn/NotShowIn against XDG_CURRENT_DESKTOP, as
+    g_desktop_app_info_get_show_in(NULL) decides it (older PyGObject can't
+    pass NULL there)."""
+    current = [d for d in os.environ.get("XDG_CURRENT_DESKTOP", "").split(":") if d]
+    only = [d for d in only_show_in.split(";") if d]
+    hidden = [d for d in not_show_in.split(";") if d]
+    for desktop in current:
+        if desktop in only:
+            return True
+        if desktop in hidden:
+            return False
+    return not only
+
+
+def autostart_entries(skip):
+    seen = set(skip)
+    for d in config_dirs():
+        directory = os.path.join(d, "autostart")
+        if not os.path.isdir(directory):
+            continue
+        for fname in sorted(os.listdir(directory)):
+            if not fname.endswith(".desktop") or fname[:-8] in seen:
+                continue
+            seen.add(fname[:-8])  # the first directory that has an entry wins, as in the spec
+            path = os.path.join(directory, fname)
+            kf = GLib.KeyFile()
+            try:
+                kf.load_from_file(path, GLib.KeyFileFlags.NONE)
+            except GLib.Error:
+                continue
+
+            def get(key, default=""):
+                try:
+                    return kf.get_string("Desktop Entry", key)
+                except GLib.Error:
+                    return default
+
+            if get("Hidden").lower() == "true" or get("X-GNOME-Autostart-enabled", "true").lower() == "false":
+                continue
+            if app_info(DesktopAppInfo.new_from_keyfile, kf) is None:  # TryExec failed
+                continue
+            if not shown_in_current_desktop(get("OnlyShowIn"), get("NotShowIn")):
+                continue
+            if get("AutostartCondition") and not autostart_condition(get("AutostartCondition")):
+                continue
+            command = exec_to_command(get("Exec"))
+            if command:
+                phase = "early" if get("X-GNOME-Autostart-Phase") in EARLY_PHASES else "late"
+                yield phase, command, fname[:-8]
+
+
+def cmd_plan(args):
+    skip = {s for s in args.skip.split(",") if s}
+    for cid in session_components(args.gnome_session) if args.gnome_session else []:
+        if cid in skip:
+            continue
+        skip.add(cid)
+        command = resolve_component(cid)
+        if command:
+            print(f"early\t{command}")
+        else:
+            log(f"component {cid}: no desktop entry or user service; skipped")
+    if args.autostart:
+        for phase, command, _entry in autostart_entries(skip):
+            print(f"{phase}\t{command}")
+
+
+def main():
+    parser = argparse.ArgumentParser(prog=PROG)
+    sub = parser.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("bridge").add_argument("name")
+    sub.add_parser("session-manager")
+    plan = sub.add_parser("plan")
+    plan.add_argument("--gnome-session", default="")
+    plan.add_argument("--skip", default="")
+    plan.add_argument("--autostart", action="store_true")
+    sub.add_parser("check")
+    args = parser.parse_args()
+
+    if args.cmd == "bridge":
+        Bridge(args.name).run()
+    elif args.cmd == "session-manager":
+        SessionManager().run()
+    elif args.cmd == "plan":
+        cmd_plan(args)
+    elif args.cmd == "check":
+        return 0
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

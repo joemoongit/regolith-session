@@ -1,0 +1,44 @@
+#!/bin/sh
+# regolith-multisession shim for pgrep and pkill, on PATH in standalone sessions only.
+#
+# All sessions of a user share one uid, so "this user's picom" matches the
+# picom of every session, and a compositor restart in one session would kill
+# the others' compositors. For the per-display programs listed in
+# MULTISESSION_DISPLAY_SCOPED, matches are restricted to processes on this
+# session's $DISPLAY (read from /proc/PID/environ). Anything else passes
+# through unchanged.
+. "${0%/*}/_common.sh"
+ms_real_path
+self=${0##*/}
+
+pattern=
+for arg do pattern=$arg; done
+if [ -z "${DISPLAY:-}" ] || [ "${MULTISESSION_SHIM_BYPASS:-}" = 1 ] || ! ms_display_scoped "$pattern"; then
+    exec "$self" "$@"
+fi
+
+sig=TERM plain=1 want_sig=0
+for arg do
+    shift
+    if [ $want_sig = 1 ]; then sig=$arg want_sig=0; continue; fi
+    case $self:$arg in
+        pkill:--signal) want_sig=1; continue ;;
+        pkill:--signal=*) sig=${arg#--signal=}; continue ;;
+        pkill:-[0-9]*|pkill:-SIG*|pkill:-[A-Z][A-Z]*) sig=${arg#-}; continue ;;
+        *:-l|*:-a|*:-c|*:-d|*:-d?*|*:-w|*:-v|*:-e|*:--list-*|*:--count|*:--delimiter*|*:--lightweight|*:--inverse|*:--echo)
+            plain=0 ;;
+    esac
+    set -- "$@" "$arg"
+done
+if [ $plain = 0 ]; then
+    [ "$self" = pkill ] && exec pkill "-$sig" "$@"
+    exec pgrep "$@"
+fi
+
+found=1
+for pid in $(pgrep "$@"); do
+    ms_on_display "$pid" || continue
+    found=0
+    if [ "$self" = pkill ]; then kill -s "${sig#SIG}" "$pid" 2>/dev/null; else echo "$pid"; fi
+done
+exit $found

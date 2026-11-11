@@ -1,0 +1,34 @@
+#!/bin/sh
+# regolith-multisession shim, on PATH in standalone sessions only.
+#
+# The systemd user manager belongs to the user's first graphical session. To
+# the programs of a standalone session, 'systemctl --user' fails as it does
+# where there is no user manager, so they take their paths for sessions
+# without systemd (e.g. the compositor's init runs picom itself instead of
+# handing its display to the first session's picom service). Calls that would
+# have changed the user manager are logged. System-scope calls pass through.
+# MULTISESSION_SHIM_BYPASS=1 disables this.
+. "${0%/*}/_common.sh"
+ms_real_path
+[ "${MULTISESSION_SHIM_BYPASS:-}" = 1 ] && exec systemctl "$@"
+
+user=0 verb='' skip=0
+for arg do
+    if [ $skip = 1 ]; then skip=0; continue; fi
+    case $arg in
+        --user) user=1 ;;
+        --version|-h|--help) exec systemctl "$@" ;;
+        -p|-t|-s|-n|-o|-H|-M|--property|--type|--state|--signal|--kill-whom|--job-mode|--root|--lines|--output|--host|--machine|--what|--timestamp|--when)
+            skip=1 ;;
+        -*) ;;
+        *) [ -z "$verb" ] && verb=$arg ;;
+    esac
+done
+[ $user = 1 ] || exec systemctl "$@"
+
+case $verb in
+    ""|is-active|is-enabled|is-failed|is-system-running|status|show|cat|list-*|show-environment|get-default) ;;
+    *) ms_log "standalone session: refused 'systemctl $*' (the user manager belongs to the first session)" ;;
+esac
+echo "Failed to connect to user scope bus: this standalone session has no user manager (the user's first session owns it)" >&2
+exit 1

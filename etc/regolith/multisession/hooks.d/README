@@ -1,0 +1,17 @@
+Hooks: every *.sh file here, and in ~/.config/regolith3/multisession/hooks.d/,
+is sourced (bash) by 'regolith-multisession launch' just before a session
+starts, in both modes. A failing hook is logged and ignored.
+
+Available to hooks:
+  MULTISESSION_SESSION   the session, e.g. regolith-x11
+  MULTISESSION_MODE      primary (stock session) or standalone
+  MULTISESSION_INSTANCE  1 for the user's first graphical session, 2, 3, ...
+  MULTISESSION_RUNDIR    per-session runtime directory
+  DISPLAY, XDG_VTNR, XDG_SESSION_ID, ...
+
+Example, 50-instance-look.sh: a different Regolith look in later sessions
+(regolith-session-x11 merges, so these win unless your Xresources set them):
+
+  if [ "$MULTISESSION_MODE" = standalone ] && [ -f ~/.config/regolith3/Xresources-instance ]; then
+      xrdb -merge ~/.config/regolith3/Xresources-instance
+  fi

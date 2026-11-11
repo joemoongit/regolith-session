@@ -1,0 +1,17 @@
+#!/bin/sh
+# regolith-multisession shim for pidof, on PATH in standalone sessions only: like the
+# pgrep shim, PIDs of the per-display programs in MULTISESSION_DISPLAY_SCOPED
+# are only reported for this session's $DISPLAY ('pidof picom' would
+# otherwise name every session's compositor).
+. "${0%/*}/_common.sh"
+ms_real_path
+{ [ -n "${DISPLAY:-}" ] && [ "${MULTISESSION_SHIM_BYPASS:-}" != 1 ]; } || exec pidof "$@"
+
+out=
+for pid in $(pidof "$@"); do
+    name=$(cat "/proc/$pid/comm" 2>/dev/null) || continue
+    if ms_display_scoped "$name" && ! ms_on_display "$pid"; then continue; fi
+    out="$out${out:+ }$pid"
+done
+[ -n "$out" ] || exit 1
+echo "$out"

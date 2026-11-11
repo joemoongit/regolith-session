@@ -107,3 +107,27 @@ Description: Additional files for regolith X11 session
  This package contains the idle monitor and polkit agent autostart desktop
  files for GNOME Flashback releases that still start them from autostart.
 
+
+Package: regolith-session-multisession
+Architecture: all
+Depends: ${misc:Depends},
+    regolith-session-flashback (>= ${source:Version}),
+    dbus-bin,
+    gir1.2-glib-2.0,
+    procps,
+    python3,
+    python3-gi,
+    util-linux
+Recommends: lightdm
+Description: Several Regolith X11 sessions at once, for one user or many
+ This package adds "Regolith / X11 (multi-session)" to the login screen. Log
+ in with it as often as you like: on any number of VTs, as any number of
+ users, and several times as the same user.
+ .
+ A user's first session is the stock Regolith session. gnome-session allows
+ only one graphical session per user, so each later session of that user
+ runs standalone: on its own D-Bus bus, with its own session components,
+ per-user services such as dconf and the keyring shared with the first
+ session, and no changes to the systemd user manager that the first session
+ owns. 'regolith-multisession new' opens another LightDM greeter from a text
+ console or a running session.
