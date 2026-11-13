@@ -1,0 +1,226 @@
+#!/bin/sh
+# Concurrent Regolith X11 sessions through LightDM: the first login of a user
+# goes through gnome-session as before, while further logins start extra
+# sessions directly (their own i3 on their own display) without touching the
+# systemd user manager that hosts the first session. Any number of users may
+# each hold any number of sessions.
+#  1. regolith-session-x11-launch calls gnome-session when no session of the
+#     user is running, and regolith-session-x11 with REGOLITH_X11_EXTRA_SESSION
+#     when one is (units active, session processes, or the manager already
+#     pointing at another display with a WM socket). A stale DISPLAY without
+#     a socket still logs in fresh.
+#  2. The extra session starts i3 without stale I3SOCK/SWAYSOCK, never calls
+#     systemctl --user (the manager keeps the first session's DISPLAY,
+#     XAUTHORITY and I3SOCK), never registers with the first session's
+#     gnome-session manager, and points its own display's wm.program.logout
+#     at i3-msg exit so Super+Shift+E closes just that session. The first
+#     display keeps no such override.
+#  3. The ordinary session still clears stale sockets through the manager.
+set -eu
+
+tmp=${AUTOPKGTEST_TMP:-$(mktemp -d)}
+export HOME="$tmp/home" XDG_RUNTIME_DIR="$tmp/xdg"
+mkdir -p "$HOME/.config/regolith3/flags" "$XDG_RUNTIME_DIR" "$tmp/bin"
+chmod 700 "$XDG_RUNTIME_DIR"
+fail=0
+
+# --- Part 1: the launcher branches without a display ---
+cat > "$tmp/bin/systemctl" <<'STUB'
+#!/bin/sh
+# STUB_SYSTEMCTL_MODE: inactive | active | env-display | stale
+mode=${STUB_SYSTEMCTL_MODE:-inactive}
+echo "systemctl $*" >> "$STUB_LOG/systemctl.log"
+case "$*" in
+    "--user is-active --quiet regolith-x11.service"|"--user is-active --quiet regolith-x11.target")
+        [ "$mode" = active ] && exit 0 || exit 1 ;;
+    "--user is-active --quiet "*)
+        [ "$mode" = active ] && exit 0 || exit 1 ;;
+    "--user show-environment")
+        case "$mode" in
+            env-display) printf 'DISPLAY=:0\nXAUTHORITY=/run/user/1000/gdm/Xauthority\nI3SOCK=/run/user/1000/i3/ipc-socket.111\n' ;;
+            stale) printf 'DISPLAY=:0\nXAUTHORITY=/run/user/1000/gdm/Xauthority\n' ;;
+        esac
+        exit 0 ;;
+    *) exit 0 ;;
+esac
+STUB
+cat > "$tmp/bin/pgrep" <<'STUB'
+#!/bin/sh
+# STUB_PGREP_MODE: none | session
+echo "pgrep $*" >> "$STUB_LOG/pgrep.log"
+[ "${STUB_PGREP_MODE:-none}" = session ] && exit 0 || exit 1
+STUB
+cat > "$tmp/bin/gnome-session" <<'STUB'
+#!/bin/sh
+echo "gnome-session $*" >> "$STUB_LOG/calls"
+echo "XDG_CURRENT_DESKTOP=$XDG_CURRENT_DESKTOP" >> "$STUB_LOG/calls"
+exit 0
+STUB
+cat > "$tmp/bin/regolith-session-x11" <<'STUB'
+#!/bin/sh
+echo "regolith-session-x11 $*" >> "$STUB_LOG/calls"
+echo "REGOLITH_X11_EXTRA_SESSION=${REGOLITH_X11_EXTRA_SESSION-}" >> "$STUB_LOG/calls"
+echo "DISPLAY=$DISPLAY XDG_SESSION_TYPE=$XDG_SESSION_TYPE XDG_SESSION_DESKTOP=$XDG_SESSION_DESKTOP" >> "$STUB_LOG/calls"
+exit 0
+STUB
+chmod +x "$tmp/bin/systemctl" "$tmp/bin/pgrep" "$tmp/bin/gnome-session" "$tmp/bin/regolith-session-x11"
+
+launch_case() { # launch_case <name> <systemctl mode> <pgrep mode> <expected>
+    name=$1 mode=$2 pgrep_mode=$3 expected=$4
+    rm -rf "$tmp/case" && mkdir -p "$tmp/case"
+    STUB_LOG="$tmp/case" STUB_SYSTEMCTL_MODE="$mode" STUB_PGREP_MODE="$pgrep_mode" \
+        PATH="$tmp/bin:$PATH" DISPLAY=:1 \
+        regolith-session-x11-launch >/dev/null 2>&1 || true
+    if grep -q "^$expected" "$tmp/case/calls" 2>/dev/null; then
+        echo "ok: launch $name calls $expected"
+    else
+        echo "FAIL: launch $name did not call $expected:"; cat "$tmp/case/calls" 2>/dev/null || echo "(no calls)"
+        fail=1
+    fi
+    if [ "$expected" = regolith-session-x11 ]; then
+        if grep -q '^REGOLITH_X11_EXTRA_SESSION=1$' "$tmp/case/calls" 2>/dev/null \
+           && grep -q 'DISPLAY=:1 XDG_SESSION_TYPE=x11 XDG_SESSION_DESKTOP=regolith-x11' "$tmp/case/calls" 2>/dev/null; then
+            echo "ok: launch $name marks the extra session on its own display"
+        else
+            echo "FAIL: launch $name extra session lacks marker or display:"; cat "$tmp/case/calls" 2>/dev/null || true
+            fail=1
+        fi
+    fi
+}
+
+launch_case "fresh" inactive none gnome-session
+launch_case "extra-units" active none regolith-session-x11
+launch_case "extra-process" inactive session regolith-session-x11
+launch_case "extra-manager-env" env-display none regolith-session-x11
+launch_case "stale-display" stale none gnome-session
+
+# --- Part 2: extra and ordinary sessions under Xvfb ---
+# Drop the Part 1 stubs that shadow the real session script.
+rm -f "$tmp/bin/regolith-session-x11" "$tmp/bin/gnome-session" "$tmp/bin/pgrep"
+for wm in i3; do :; done
+cat > "$tmp/bin/i3" <<EOF
+#!/bin/sh
+echo "DISPLAY=\$DISPLAY" > "$tmp/i3.env.\$STUB_RUN"
+echo "I3SOCK=\${I3SOCK-}" >> "$tmp/i3.env.\$STUB_RUN"
+echo "SWAYSOCK=\${SWAYSOCK-}" >> "$tmp/i3.env.\$STUB_RUN"
+echo "NOTIFY_SOCKET=\${NOTIFY_SOCKET-}" >> "$tmp/i3.env.\$STUB_RUN"
+echo "args=\$*" >> "$tmp/i3.env.\$STUB_RUN"
+exit 0
+EOF
+cat > "$tmp/bin/dbus-send" <<'STUB'
+#!/bin/sh
+echo "dbus-send $*" >> "$STUB_LOG/dbus.log"
+exit 0
+STUB
+chmod +x "$tmp/bin/i3" "$tmp/bin/dbus-send"
+
+Xvfb :98 -screen 0 1280x800x24 -nolisten tcp -noreset >"$tmp/xvfb98.log" 2>&1 &
+xvfb98=$!
+Xvfb :99 -screen 0 1280x800x24 -nolisten tcp -noreset >"$tmp/xvfb99.log" 2>&1 &
+xvfb99=$!
+trap 'kill $xvfb98 $xvfb99 2>/dev/null || true' EXIT
+for _ in 1 2 3 4 5 6 7 8 9 10; do
+    DISPLAY=:98 xrdb -query >/dev/null 2>&1 && DISPLAY=:99 xrdb -query >/dev/null 2>&1 && break
+    sleep 0.5
+done
+echo 'first.display: ready' | DISPLAY=:98 xrdb -merge
+echo 'extra.display: ready' | DISPLAY=:99 xrdb -merge
+
+cat > "$tmp/run" <<'EOF2'
+#!/bin/sh
+set -eu
+t=$AUTOPKGTEST_TMP
+export STUB_LOG="$t/part2"
+mkdir -p "$STUB_LOG"
+export PATH="$t/bin:$PATH"
+export XDG_SESSION_TYPE=x11 XDG_CURRENT_DESKTOP=Regolith:GNOME-Flashback:GNOME
+stale=$XDG_RUNTIME_DIR/stale-ipc.sock
+# Ordinary systemd session on the first display, with a stale socket and an
+# autostart id as gnome-session would give it.
+STUB_RUN=fresh NOTIFY_SOCKET="$t/notify" DISPLAY=:98 DESKTOP_AUTOSTART_ID=fresh-id \
+    I3SOCK="$stale" SWAYSOCK="$stale" \
+    timeout 60 regolith-session-x11 > "$t/fresh.log" 2>&1 || cat "$t/fresh.log"
+# Extra session on its own display, as the launcher starts it: no systemd,
+# its own autostart id would only exist if something leaked it.
+STUB_RUN=extra env -u NOTIFY_SOCKET DISPLAY=:99 DESKTOP_AUTOSTART_ID=leaked-id \
+    REGOLITH_X11_EXTRA_SESSION=1 I3SOCK="$stale" SWAYSOCK="$stale" \
+    timeout 60 regolith-session-x11 > "$t/extra.log" 2>&1 || cat "$t/extra.log"
+EOF2
+chmod +x "$tmp/run"
+rm -rf "$tmp/part2" && mkdir -p "$tmp/part2"
+AUTOPKGTEST_TMP="$tmp" dbus-run-session -- "$tmp/run"
+
+check_i3() { # check_i3 <run> <display>
+    f="$tmp/i3.env.$1"
+    if [ ! -f "$f" ]; then echo "FAIL: $1: the i3 stub did not run"; fail=1; return; fi
+    got=$(sed -n 's/^DISPLAY=//p' "$f")
+    if [ "$got" = "$2" ]; then echo "ok: $1: i3 on $got"; else echo "FAIL: $1: i3 on '$got', expected '$2'"; fail=1; fi
+    for var in I3SOCK SWAYSOCK; do
+        got=$(sed -n "s/^$var=//p" "$f")
+        if [ -z "$got" ]; then echo "ok: $1: i3 without $var"; else echo "FAIL: $1: i3 with $var=$got"; fail=1; fi
+    done
+}
+check_i3 fresh :98
+check_i3 extra :99
+
+# The ordinary session clears the stale sockets through the user manager;
+# the extra session never calls systemctl --user at all.
+if grep -q 'unset-environment.*I3SOCK.*SWAYSOCK\|unset-environment.*SWAYSOCK.*I3SOCK' "$tmp/part2/systemctl.log" 2>/dev/null; then
+    echo "ok: ordinary session unsets stale sockets through the user manager"
+else
+    echo "FAIL: ordinary session did not unset stale sockets:"; cat "$tmp/part2/systemctl.log" 2>/dev/null || echo "(no systemctl calls)"
+    fail=1
+fi
+# Count systemctl calls per run: the fresh run may call it, the extra run must not.
+# The stub logs every call; the extra run's i3 saw a dummy NOTIFY_SOCKET, so the
+# i3 config's systemctl start is replaced by a notify to nowhere.
+if grep -q -- '--user' "$tmp/part2/systemctl.log" 2>/dev/null; then
+    # At least one call exists (the fresh unset); verify none came from the extra
+    # run by re-running the extra session alone with a clean log.
+    rm -f "$tmp/part2/systemctl.log" "$tmp/i3.env.extra2"
+    STUB_LOG="$tmp/part2" STUB_RUN=extra2 PATH="$tmp/bin:$PATH" XDG_SESSION_TYPE=x11 \
+        XDG_CURRENT_DESKTOP=Regolith:GNOME-Flashback:GNOME \
+        dbus-run-session -- sh -c 'env -u NOTIFY_SOCKET DISPLAY=:99 REGOLITH_X11_EXTRA_SESSION=1 timeout 60 regolith-session-x11 > "$AUTOPKGTEST_TMP/extra2.log" 2>&1 || cat "$AUTOPKGTEST_TMP/extra2.log"' || true
+    if [ -f "$tmp/part2/systemctl.log" ]; then
+        echo "FAIL: extra session called systemctl --user:"; cat "$tmp/part2/systemctl.log"
+        fail=1
+    else
+        echo "ok: extra session never calls systemctl --user"
+    fi
+else
+    echo "FAIL: no systemctl calls logged at all"; fail=1
+fi
+
+# The extra session must not register with the first session's manager, even
+# with a leaked autostart id; the ordinary --builtin path would.
+if grep -q 'RegisterClient' "$tmp/part2/dbus.log" 2>/dev/null; then
+    echo "FAIL: extra session registered with gnome-session:"; cat "$tmp/part2/dbus.log"
+    fail=1
+else
+    echo "ok: extra session does not register with gnome-session"
+fi
+
+# Super+Shift+E in the extra session exits just that i3; the first display
+# keeps the default logout.
+if DISPLAY=:99 xrdb -query | grep -q '^wm\.program\.logout:.*/i3-msg exit'; then
+    echo "ok: extra display logs out through its own i3"
+else
+    echo "FAIL: extra display lacks the per-session logout:"; DISPLAY=:99 xrdb -query | grep 'wm.program.logout' || echo "(no wm.program.logout)"
+    fail=1
+fi
+if DISPLAY=:98 xrdb -query | grep -q '^wm\.program\.logout:'; then
+    echo "FAIL: first display logout was overridden:"; DISPLAY=:98 xrdb -query | grep '^wm\.program\.logout:'
+    fail=1
+else
+    echo "ok: first display keeps its own logout"
+fi
+
+# The extra i3 must not start the systemd target (dummy NOTIFY_SOCKET).
+if grep -q 'regolith-x11-extra-notify' "$tmp/i3.env.extra" 2>/dev/null; then
+    echo "ok: extra i3 is shielded from the user manager"
+else
+    echo "FAIL: extra i3 lacks the dummy NOTIFY_SOCKET:"; cat "$tmp/i3.env.extra" 2>/dev/null || echo "(no env)"
+    fail=1
+fi
+
+exit $fail

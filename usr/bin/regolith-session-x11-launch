@@ -16,6 +16,74 @@ case ":${XDG_CONFIG_DIRS-}:" in
     *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-$SESSION_TYPE:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
 esac
 
+# Concurrent X11 logins through LightDM: gnome-session on systemd manages a
+# single graphical session per user (and gnome-session 49 removed --builtin),
+# so a second login through gnome-session would fail and drop back to the
+# login screen. When this user already has a session running, start an extra
+# session directly instead: its own i3 on its own display, without touching
+# the systemd user manager that hosts the first session. Any number of users
+# may each hold any number of sessions this way; a login with no session of
+# its own running keeps going through gnome-session below.
+has_running_session() {
+    local unit
+    for unit in regolith-x11.service regolith-x11.target \
+                regolith-wayland.service regolith-wayland.target \
+                "gnome-session@$SESSION_TYPE.target" \
+                gnome-session.target gnome-session-initialized.target; do
+        if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+            return 0
+        fi
+    done
+
+    if command -v pgrep >/dev/null 2>&1; then
+        local uid
+        uid=$(id -u 2>/dev/null) || uid=""
+        if [ -n "$uid" ]; then
+            # A Regolith X11 session script. The launcher ends in -launch,
+            # the session script does not, so this does not match this login.
+            if pgrep -u "$uid" -f "[r]egolith-session-x11([[:space:]]|$)" >/dev/null 2>&1; then
+                return 0
+            fi
+            # An i3 window manager, including stubbed ones in tests. i3-msg
+            # ends in -msg, so it does not match.
+            if pgrep -u "$uid" -f "(^|/)[i]3([[:space:]]|$)" >/dev/null 2>&1; then
+                return 0
+            fi
+            # A gnome-session manager (the first, systemd-managed session).
+            if pgrep -u "$uid" -f "(^|/)[g]nome-session([[:space:]]|$)" >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+    fi
+
+    # Fallback for a running session whose units and processes are not
+    # visible here: the user manager already points at another display and
+    # holds that session's window-manager socket. A stale DISPLAY left after
+    # a logout has no socket (the units unset it when they stop), so that
+    # login still goes through gnome-session below and clears it.
+    if command -v systemctl >/dev/null 2>&1; then
+        local manager_env manager_display manager_wm
+        manager_env=$(systemctl --user show-environment 2>/dev/null) || manager_env=""
+        if [ -n "$manager_env" ]; then
+            manager_display=$(printf '%s\n' "$manager_env" | sed -n 's/^DISPLAY=//p' | tail -n 1) || true
+            manager_wm=$(printf '%s\n' "$manager_env" | grep -E '^(I3SOCK|SWAYSOCK)=' | tail -n 1) || true
+            if [ -n "${manager_display-}" ] && [ -n "${manager_wm-}" ] \
+               && [ "${manager_display-}" != "${DISPLAY-}" ]; then
+                return 0
+            fi
+        fi
+    fi
+
+    return 1
+}
+
+if has_running_session; then
+    export REGOLITH_X11_EXTRA_SESSION=1
+    export XDG_SESSION_TYPE="${XDG_SESSION_TYPE:-x11}"
+    export XDG_SESSION_DESKTOP="${XDG_SESSION_DESKTOP:-$SESSION_TYPE}"
+    exec regolith-session-x11 "$@"
+fi
+
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     source /etc/os-release

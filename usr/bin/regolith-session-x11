@@ -5,6 +5,14 @@ set -Eeu -o pipefail
 
 source /usr/lib/regolith/regolith-session-common.sh
 
+# Extra sessions (concurrent LightDM logins, see regolith-session-x11-launch)
+# run without gnome-session and without the systemd user manager, which hosts
+# the first session. They must not touch that manager's environment (DISPLAY,
+# XAUTHORITY, I3SOCK) and must not register with the first session's manager.
+is_extra_session() {
+    [ -n "${REGOLITH_X11_EXTRA_SESSION-}" ]
+}
+
 gdm3_xrdb_fixup() {
     if xrescat testkey defaultval > /dev/null 2>&1; then
         echo "xrdb appears to be property initialized, skipping xrdb init"
@@ -20,7 +28,9 @@ if [ -z "${NOTIFY_SOCKET-}" ]; then
   # Register with gnome-session so that it does not kill the whole session thinking it is dead.
   # When gnome-session respawns us after i3 crashed, the client is still
   # registered and this fails with AlreadyRegistered; i3 must start anyway.
-  if [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
+  # Extra sessions have no manager of their own; registering would attach
+  # this i3 to the first session's manager over the shared session bus.
+  if [ -n "${DESKTOP_AUTOSTART_ID-}" ] && ! is_extra_session; then
       dbus-send --print-reply --session --dest=org.gnome.SessionManager "/org/gnome/SessionManager" org.gnome.SessionManager.RegisterClient "string:Regolith-X11" "string:$DESKTOP_AUTOSTART_ID" \
           || echo "Could not register with gnome-session, continuing"
   fi
@@ -30,7 +40,13 @@ if [ -z "${NOTIFY_SOCKET-}" ]; then
 fi
 
 # --------- Script Main -----------
-clear_wm_sockets    # SWAYSOCK and I3SOCK of an earlier session
+if is_extra_session; then
+    # Drop stale sockets locally only; the user manager still hosts the
+    # first session and its I3SOCK must keep pointing there.
+    unset I3SOCK SWAYSOCK
+else
+    clear_wm_sockets    # SWAYSOCK and I3SOCK of an earlier session
+fi
 
 gdm3_xrdb_fixup     # Remove when https://bugs.launchpad.net/ubuntu/+source/gdm3/+bug/1955850 is fixed
 load_i3_resources   # ~/.Xresources, ~/.config/regolith3/Xresources and the look, as 'regolith-look refresh' does
@@ -52,14 +68,34 @@ if [ ! -e "$UPDATE_FLAG_DIR" ]; then
 fi
 
 resolve_default_config_file
+if is_extra_session; then
+    # Super+Shift+E must close just this session. The binding runs
+    # wm.program.logout, which defaults to gnome-session-quit --logout and
+    # would log out the first session over the shared session bus. Point it
+    # at this display's own i3 instead; xrdb is per-display, so the first
+    # session keeps its own logout.
+    printf 'wm.program.logout: %s\n' '/usr/bin/i3-msg exit' | xrdb -nocpp -merge \
+        || echo "Could not set extra session logout, continuing"
+    # The i3 config starts regolith-x11.target when NOTIFY_SOCKET is empty
+    # and notifies otherwise. An extra session must do neither against the
+    # first session's user manager; a dummy socket makes it notify nowhere.
+    export NOTIFY_SOCKET="${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/regolith-x11-extra-notify"
+fi
 echo "Regolith is launching i3 with $I3_CONFIG_FILE"
 i3 -c "$I3_CONFIG_FILE"
 
 # Run the user's post-logout script. In a systemd-managed session,
 # regolith-post-logout.service runs it when the session ends: logging out
 # stops this script together with the window manager, so it would never get
-# here. Without systemd (gnome-session --builtin) it runs here.
-if [ -z "${NOTIFY_SOCKET-}" ] && [ -f "$USER_POST_LOGOUT_SCRIPT_FILE" ] ; then
+# here. Without systemd (gnome-session --builtin) it runs here. Extra
+# sessions have no such service either, so they run it here when this
+# session ends, whatever NOTIFY_SOCKET was set to above for i3.
+if is_extra_session; then
+    if [ -f "$USER_POST_LOGOUT_SCRIPT_FILE" ] ; then
+        echo "Regolith is launching user post-logout file $USER_POST_LOGOUT_SCRIPT_FILE"
+        timeout --verbose 5 bash "$USER_POST_LOGOUT_SCRIPT_FILE"
+    fi
+elif [ -z "${NOTIFY_SOCKET-}" ] && [ -f "$USER_POST_LOGOUT_SCRIPT_FILE" ] ; then
     echo "Regolith is launching user post-logout file $USER_POST_LOGOUT_SCRIPT_FILE"
 	timeout --verbose 5 bash "$USER_POST_LOGOUT_SCRIPT_FILE"
 fi
