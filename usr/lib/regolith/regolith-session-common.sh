@@ -67,6 +67,11 @@ import_environment_d() {
 # they run under sway. The window managers set the variables they need.
 clear_wm_sockets() {
     unset I3SOCK SWAYSOCK
+    # A session started on its own next to another one shares the user
+    # manager with it, and the variables there are the other session's
+    if [ -n "${REGOLITH_SESSION_STANDALONE-}" ]; then
+        return 0
+    fi
     systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
 }
 
@@ -251,9 +256,25 @@ load_system_xres() {
     done
 }
 
+# A session started on its own (regolith-session-x11-launch) has no
+# gnome-session to log out, restart or power off through: i3 ends the
+# session, and logind restarts or powers off the computer. Loaded first, so
+# the user's Xresources still win.
+load_standalone_xres() {
+    if [ -z "${REGOLITH_SESSION_STANDALONE-}" ]; then
+        return 0
+    fi
+    xrdb -nocpp -merge <<'EOF'
+wm.program.logout: i3-msg exit
+wm.program.reboot: systemctl reboot
+wm.program.shutdown: systemctl poweroff
+EOF
+}
+
 # Load the X resources as the login does: ~/.Xresources first, then the
 # Regolith Xresources and the look, which win over it
 load_i3_resources() {
+    load_standalone_xres # logout, reboot and power off without gnome-session
     load_standard_xres # ~/.Xresources
     load_regolith_xres # ~/.config/regolith3/Xresources and the look
     xres_i3_cleanup    # Single-quote workspace names for i3

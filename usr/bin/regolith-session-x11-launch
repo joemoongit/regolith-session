@@ -16,6 +16,20 @@ case ":${XDG_CONFIG_DIRS-}:" in
     *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-$SESSION_TYPE:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
 esac
 
+# A user's sessions share one systemd user manager, and gnome-session runs
+# one session in it. While another graphical session of the user is active
+# there, as when they log in again on another VT, gnome-session gives up at
+# once ("Session manager is already running!"), after putting this login's
+# DISPLAY into the running session's environment, and the display manager
+# shows the login screen again. Run this session on its own instead, without
+# gnome-session and on a D-Bus session bus of its own, so that it stays out of
+# the running session's way: its services and applications start on this
+# display, and logging out ends this session only.
+if systemctl --user --quiet is-active graphical-session.target 2>/dev/null; then
+    export REGOLITH_SESSION_STANDALONE=1
+    exec dbus-run-session -- regolith-session-x11 "$@"
+fi
+
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     source /etc/os-release
