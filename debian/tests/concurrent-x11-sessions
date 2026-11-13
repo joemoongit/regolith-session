@@ -1,0 +1,195 @@
+#!/bin/sh
+# Additional LightDM logins of a user whose Regolith X11 session is
+# already running must open further usable sessions instead of failing
+# in a second gnome-session: the user manager, its gnome-session targets
+# and the SessionManager exist once per user, so a second gnome-session
+# ends at once. Each additional login runs its own i3 on its own display
+# through regolith-session-x11-launch, leaves the first session and the
+# user manager's DISPLAY, XAUTHORITY and I3SOCK for it alone, and ends
+# only its own session on Regolith's logout shortcut (Super+Shift+E,
+# wm.program.logout). A user with no session running still logs in
+# through gnome-session, also when other users have sessions running.
+# Runs the logins on Xvfb displays with a fake user manager and a stub
+# gnome-session that stays running as the primary session; i3 is real.
+set -eu
+
+tmp=${AUTOPKGTEST_TMP:-$(mktemp -d)}
+export HOME="$tmp/home" XDG_RUNTIME_DIR="$tmp/xdg"
+export FAKE_TMP="$tmp" FAKE_USER_ENV="$tmp/user-env" FAKE_ACTIVE="$tmp/active-units"
+export FAKE_SYSTEMD_LOG="$tmp/systemctl.log"
+mkdir -p "$HOME/.config/regolith3/flags" "$tmp/home-other/.config/regolith3/flags" \
+         "$XDG_RUNTIME_DIR" "$tmp/xdg-other" "$tmp/bin"
+chmod 700 "$XDG_RUNTIME_DIR" "$tmp/xdg-other"
+fail=0
+primary_pid= extra1_pid= extra2_pid= other_pid=
+
+# A fake systemd user manager: units it reports active and the
+# environment it records live in files, as one user manager would.
+cat > "$tmp/bin/systemctl" <<'STUB'
+#!/bin/sh
+echo "systemctl $*" >> "$FAKE_SYSTEMD_LOG"
+args=""; for a in "$@"; do [ "$a" = "--user" ] || args="$args $a"; done
+# shellcheck disable=SC2086
+set -- $args
+cmd=${1:-}; [ $# -gt 0 ] && shift
+case "$cmd" in
+    is-active)
+        [ "${1:-}" = "--quiet" ] && shift
+        grep -qx "${1:-}" "$FAKE_ACTIVE" 2>/dev/null ;;
+    show-environment) cat "$FAKE_USER_ENV" ;;
+    set-environment)
+        for kv in "$@"; do k=${kv%%=*}
+            grep -v "^$k=" "$FAKE_USER_ENV" > "$FAKE_USER_ENV.tmp" || true
+            mv "$FAKE_USER_ENV.tmp" "$FAKE_USER_ENV"; echo "$kv" >> "$FAKE_USER_ENV"
+        done ;;
+    unset-environment)
+        for k in "$@"; do
+            grep -v "^$k=" "$FAKE_USER_ENV" > "$FAKE_USER_ENV.tmp" || true
+            mv "$FAKE_USER_ENV.tmp" "$FAKE_USER_ENV"
+        done ;;
+    show) echo 0 ;;
+    *) : ;;
+esac
+STUB
+# The primary session: stays running, and records this login's display
+# in the user manager, as gnome-session does.
+cat > "$tmp/bin/gnome-session" <<'STUB'
+#!/bin/sh
+echo "gnome-session $* DISPLAY=${DISPLAY-}" >> "$FAKE_TMP/gnome.log"
+printf 'regolith-x11.service\n' > "$FAKE_ACTIVE"
+printf 'DISPLAY=%s\nXAUTHORITY=%s\nI3SOCK=%s\n' \
+    "$DISPLAY" "$XAUTHORITY" "$FAKE_TMP/i3-first.sock" > "$FAKE_USER_ENV"
+sleep 300
+STUB
+chmod +x "$tmp/bin/systemctl" "$tmp/bin/gnome-session"
+: > "$FAKE_ACTIVE"; : > "$FAKE_USER_ENV"; : > "$FAKE_SYSTEMD_LOG"; : > "$tmp/gnome.log"
+
+displays=
+start_xvfb() { # start_xvfb: prints the display number
+    Xvfb -displayfd 3 -screen 0 1024x768x24 -nolisten tcp -noreset \
+        3>"$tmp/display.$1" >"$tmp/xvfb.$1.log" 2>&1 &
+    echo $! >> "$tmp/xvfb.pids"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$tmp/display.$1" ] && break; sleep 0.5; done
+    cat "$tmp/display.$1"
+}
+for name in one two three four; do
+    d=$(start_xvfb "$name")
+    displays="$displays $d"
+    eval "display_$name=$d"
+done
+trap 'for p in $primary_pid $extra1_pid $extra2_pid $other_pid; do
+          [ -z "$p" ] || kill "$p" 2>/dev/null || true
+      done
+      pkill -f "$tmp/bin/gnome-session" 2>/dev/null || true
+      pkill -x i3 2>/dev/null || true
+      while read -r p; do kill "$p" 2>/dev/null || true; done < "$tmp/xvfb.pids"' EXIT
+
+alive() { [ -n "$1" ] && kill -0 "$1" 2>/dev/null; }
+wait_i3() { # wait_i3 <display>
+    for _ in $(seq 1 40); do
+        DISPLAY=:$1 i3-msg -t get_version > /dev/null 2>&1 && return 0
+        sleep 0.5
+    done
+    return 1
+}
+check_env_unchanged() { # check_env_unchanged <what>
+    if diff "$tmp/user-env.before" "$FAKE_USER_ENV" > /dev/null; then
+        echo "ok: user manager environment unchanged by $1"
+    else
+        echo "FAIL: user manager environment changed by $1:"
+        diff "$tmp/user-env.before" "$FAKE_USER_ENV" || true
+        fail=1
+    fi
+}
+
+# 1. First login, with no session of this user running: gnome-session.
+DISPLAY=:$display_one XAUTHORITY="$tmp/auth-one" PATH="$tmp/bin:$PATH" \
+    dbus-run-session -- regolith-session-x11-launch > "$tmp/primary.log" 2>&1 &
+primary_pid=$!
+for _ in $(seq 1 20); do [ -s "$tmp/gnome.log" ] && break; sleep 0.5; done
+if [ "$(grep -c '^gnome-session' "$tmp/gnome.log")" -eq 1 ] && alive "$primary_pid"; then
+    echo "ok: first login starts through gnome-session and stays running"
+else
+    echo "FAIL: first login did not stay in gnome-session"; cat "$tmp/primary.log"; fail=1
+fi
+cp "$FAKE_USER_ENV" "$tmp/user-env.before"
+
+# 2. Two more logins of the same user: each its own i3 on its own
+#    display, no further gnome-session, first session's record kept.
+DISPLAY=:$display_two XAUTHORITY="$tmp/auth-two" PATH="$tmp/bin:$PATH" \
+    dbus-run-session -- regolith-session-x11-launch > "$tmp/extra1.log" 2>&1 &
+extra1_pid=$!
+DISPLAY=:$display_three XAUTHORITY="$tmp/auth-three" PATH="$tmp/bin:$PATH" \
+    dbus-run-session -- regolith-session-x11-launch > "$tmp/extra2.log" 2>&1 &
+extra2_pid=$!
+for d in $display_two $display_three; do
+    if wait_i3 "$d" && DISPLAY=:$d i3-msg -t get_workspaces > /dev/null; then
+        echo "ok: additional session on :$d runs its own i3"
+    else
+        echo "FAIL: additional session on :$d has no usable i3"; fail=1
+    fi
+done
+if [ "$(grep -c '^gnome-session' "$tmp/gnome.log")" -eq 1 ]; then
+    echo "ok: additional logins do not start another gnome-session"
+else
+    echo "FAIL: additional logins started gnome-session again"; cat "$tmp/gnome.log"; fail=1
+fi
+if alive "$extra1_pid" && alive "$extra2_pid"; then
+    echo "ok: additional sessions stay open"
+else
+    echo "FAIL: an additional session ended at once"
+    cat "$tmp/extra1.log" "$tmp/extra2.log"; fail=1
+fi
+check_env_unchanged "the additional logins"
+for d in $display_two $display_three; do
+    logout=$(DISPLAY=:$d xrescat wm.program.logout none)
+    if [ "$logout" = "i3-msg exit" ]; then
+        echo "ok: additional session on :$d logs out through its own i3"
+    else
+        echo "FAIL: additional session on :$d has wm.program.logout '$logout'"
+        fail=1
+    fi
+done
+
+# 3. A login of another user, whose own user manager has no session
+#    running, still goes through gnome-session.
+: > "$tmp/active-other"; : > "$tmp/user-env-other"
+HOME="$tmp/home-other" XDG_RUNTIME_DIR="$tmp/xdg-other" \
+    DISPLAY=:$display_four XAUTHORITY="$tmp/auth-four" \
+    FAKE_ACTIVE="$tmp/active-other" FAKE_USER_ENV="$tmp/user-env-other" \
+    PATH="$tmp/bin:$PATH" \
+    dbus-run-session -- regolith-session-x11-launch > "$tmp/other.log" 2>&1 &
+other_pid=$!
+for _ in $(seq 1 20); do
+    [ "$(grep -c '^gnome-session' "$tmp/gnome.log")" -eq 2 ] && break; sleep 0.5
+done
+if [ "$(grep -c '^gnome-session' "$tmp/gnome.log")" -eq 2 ] && alive "$other_pid"; then
+    echo "ok: another user's first login starts through gnome-session"
+else
+    echo "FAIL: another user's first login was diverted from gnome-session"
+    cat "$tmp/other.log"; fail=1
+fi
+check_env_unchanged "another user's login"
+
+# 4. Regolith's logout shortcut in one additional session closes only
+#    that session.
+DISPLAY=:$display_two xdotool key super+shift+e
+for _ in $(seq 1 40); do alive "$extra1_pid" || break; sleep 0.5; done
+if alive "$extra1_pid"; then
+    echo "FAIL: logout left the additional session running"; fail=1
+else
+    echo "ok: logout closed the additional session"
+fi
+if alive "$primary_pid" && alive "$extra2_pid" && alive "$other_pid"; then
+    echo "ok: the other sessions keep running after that logout"
+else
+    echo "FAIL: logout closed another session"; fail=1
+fi
+if wait_i3 "$display_three"; then
+    echo "ok: the remaining additional session's i3 still answers"
+else
+    echo "FAIL: the remaining additional session's i3 no longer answers"; fail=1
+fi
+check_env_unchanged "the additional session's logout"
+
+exit $fail

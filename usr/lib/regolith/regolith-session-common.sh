@@ -70,6 +70,174 @@ clear_wm_sockets() {
     systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
 }
 
+# Drop the IPC socket variables in this process only. An additional X11
+# session uses this instead of clear_wm_sockets: the systemd user manager
+# is shared by every session of the user, so unsetting I3SOCK and SWAYSOCK
+# there would remove the first session's variables.
+clear_wm_sockets_local() {
+    unset I3SOCK SWAYSOCK
+}
+
+# State file of the primary (gnome-session) X11 session, written by
+# regolith-session-x11-launch in the per-user runtime directory before it
+# execs gnome-session, so $$ and later gnome-session share a PID. It lets
+# later logins find that session and restore the user manager environment
+# that a display manager's Xsession uploaded this login's values over.
+REGOLITH_X11_PRIMARY_SESSION_FILE="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/regolith-x11-primary-session}"
+
+# Record this process as the primary X11 session. Called just before exec
+# of gnome-session, whose leader process keeps this PID for the session.
+regolith_x11_record_primary_session() {
+    local file=${REGOLITH_X11_PRIMARY_SESSION_FILE-}
+    local tmp
+    [ -n "$file" ] || return 0
+    [ -d "${XDG_RUNTIME_DIR-}" ] || return 0
+    tmp="$file.tmp.$$"
+    printf 'PID=%s\nDISPLAY=%s\nXAUTHORITY=%s\n' \
+        "$$" "${DISPLAY-}" "${XAUTHORITY-}" > "$tmp" 2>/dev/null || return 0
+    mv -f "$tmp" "$file" 2>/dev/null || rm -f "$tmp" 2>/dev/null || :
+}
+
+# Directory with one file per running Regolith X11 session script of
+# this user, named by its PID. A login that reaches regolith-session-x11
+# directly, without the launcher or a user manager that can be asked,
+# is found through these files instead.
+REGOLITH_X11_SESSIONS_DIR="${XDG_RUNTIME_DIR:+$XDG_RUNTIME_DIR/regolith-x11-sessions}"
+
+# Record this session script as running, and remove the record when it
+# ends. Stale records name a dead PID and are ignored.
+regolith_x11_register_running_session() {
+    local dir=${REGOLITH_X11_SESSIONS_DIR-} file
+    [ -n "$dir" ] || return 0
+    [ -d "${XDG_RUNTIME_DIR-}" ] || return 0
+    mkdir -p "$dir" 2>/dev/null || return 0
+    file="$dir/$$"
+    printf 'PID=%s\nDISPLAY=%s\nXAUTHORITY=%s\n' \
+        "$$" "${DISPLAY-}" "${XAUTHORITY-}" > "$file" 2>/dev/null || return 0
+    REGOLITH_X11_RUNNING_SESSION_FILE="$file"
+    trap 'rm -f "${REGOLITH_X11_RUNNING_SESSION_FILE-}"' EXIT
+}
+
+# Is a Regolith X11 session script of this user already running?
+regolith_x11_running_session_active() {
+    local dir=${REGOLITH_X11_SESSIONS_DIR-} entry pid cmdline
+    [ -n "$dir" ] && [ -d "$dir" ] || return 1
+    for entry in "$dir"/*; do
+        [ -f "$entry" ] || continue
+        pid=$(sed -n 's/^PID=//p' "$entry" | head -n 1)
+        case $pid in ''|*[!0-9]*) continue ;; esac
+        [ "$pid" -gt 0 ] 2>/dev/null || continue
+        kill -0 "$pid" 2>/dev/null || continue
+        if [ -r "/proc/$pid/cmdline" ]; then
+            cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+            case $cmdline in
+                *"/regolith-session-x11 "*|*" regolith-session-x11 "*) return 0 ;;
+                *) continue ;;
+            esac
+        else
+            return 0
+        fi
+    done
+    return 1
+}
+
+# Is the primary, gnome-session-managed Regolith X11 session of this user
+# already running? The user manager and its gnome-session targets are
+# singletons per user, so a second gnome-session for the same user cannot
+# start alongside it. A running session script counts too: a new
+# gnome-session cannot be started next to it either.
+regolith_x11_primary_session_active() {
+    local file=${REGOLITH_X11_PRIMARY_SESSION_FILE-} pid cmdline unit
+    if [ -n "$file" ] && [ -f "$file" ]; then
+        pid=$(sed -n 's/^PID=//p' "$file" | head -n 1)
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            if [ -r "/proc/$pid/cmdline" ]; then
+                cmdline=$(tr '\0' ' ' < "/proc/$pid/cmdline")
+                case $cmdline in
+                    *gnome-session*) return 0 ;;
+                esac
+            else
+                return 0
+            fi
+        fi
+    fi
+    if regolith_x11_running_session_active; then
+        return 0
+    fi
+    if command -v systemctl > /dev/null 2>&1; then
+        for unit in regolith-x11.service \
+                    gnome-session@regolith-x11.target \
+                    gnome-session-x11@regolith-x11.target \
+                    regolith-x11.target; do
+            if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+                return 0
+            fi
+        done
+    fi
+    return 1
+}
+
+# Print "DISPLAY XAUTHORITY" of the primary session, from the state file,
+# or failing that from the environment of regolith-x11.service's main
+# process, which started with the primary session's values.
+regolith_x11_primary_session_env() {
+    local file=${REGOLITH_X11_PRIMARY_SESSION_FILE-} display= xauthority= pid line
+    if [ -n "$file" ] && [ -f "$file" ]; then
+        display=$(sed -n 's/^DISPLAY=//p' "$file" | head -n 1)
+        xauthority=$(sed -n 's/^XAUTHORITY=//p' "$file" | head -n 1)
+    fi
+    if [ -z "$display" ] && command -v systemctl > /dev/null 2>&1; then
+        pid=$(systemctl --user show -p MainPID --value regolith-x11.service 2>/dev/null) || pid=
+        case $pid in ''|*[!0-9]*) pid= ;; esac
+        if [ -n "$pid" ] && [ "$pid" -gt 0 ] 2>/dev/null && [ -r "/proc/$pid/environ" ]; then
+            while IFS= read -r -d '' line || [ -n "$line" ]; do
+                case $line in
+                    DISPLAY=*) display=${line#DISPLAY=} ;;
+                    XAUTHORITY=*) xauthority=${line#XAUTHORITY=} ;;
+                esac
+            done < "/proc/$pid/environ"
+        fi
+    fi
+    [ -n "$display" ] || return 1
+    printf '%s\n%s\n' "$display" "$xauthority"
+}
+
+# Put the primary session's DISPLAY and XAUTHORITY back into the systemd
+# user manager (and the D-Bus activation environment) when something since
+# that session started, such as this login's Xsession scripts, uploaded
+# the new session's values over them. This login keeps its own values in
+# its own process environment; only the shared record for the first
+# session is restored. I3SOCK is never touched: it still holds the first
+# session's i3 socket.
+regolith_x11_restore_primary_session_env() {
+    local primary display xauthority current cur_display= cur_xauthority=
+    command -v systemctl > /dev/null 2>&1 || return 0
+    primary=$(regolith_x11_primary_session_env) || return 0
+    display=$(printf '%s\n' "$primary" | sed -n '1p')
+    xauthority=$(printf '%s\n' "$primary" | sed -n '2p')
+    [ -n "$display" ] || return 0
+    current=$(systemctl --user show-environment 2>/dev/null) || return 0
+    cur_display=$(printf '%s\n' "$current" | sed -n 's/^DISPLAY=//p' | head -n 1)
+    cur_xauthority=$(printf '%s\n' "$current" | sed -n 's/^XAUTHORITY=//p' | head -n 1)
+    if [ "$cur_display" = "$display" ] && [ "$cur_xauthority" = "$xauthority" ]; then
+        return 0
+    fi
+    if [ -n "$xauthority" ]; then
+        systemctl --user set-environment "DISPLAY=$display" "XAUTHORITY=$xauthority" 2>/dev/null || return 0
+        if [ -n "${DBUS_SESSION_BUS_ADDRESS-}" ] \
+           && command -v dbus-update-activation-environment > /dev/null 2>&1; then
+            dbus-update-activation-environment "DISPLAY=$display" "XAUTHORITY=$xauthority" 2>/dev/null || :
+        fi
+    else
+        systemctl --user set-environment "DISPLAY=$display" 2>/dev/null || return 0
+        if [ -n "${DBUS_SESSION_BUS_ADDRESS-}" ] \
+           && command -v dbus-update-activation-environment > /dev/null 2>&1; then
+            dbus-update-activation-environment "DISPLAY=$display" 2>/dev/null || :
+        fi
+    fi
+    return 0
+}
+
 # Determine where the default i3 and sway config files are
 # Sets I3_CONFIG_FILE and SWAY_CONFIG_FILE
 resolve_default_config_file() {

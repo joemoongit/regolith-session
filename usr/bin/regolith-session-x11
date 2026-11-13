@@ -14,9 +14,33 @@ gdm3_xrdb_fixup() {
         load_system_xres
     fi
 }
+# An additional session runs next to the primary, gnome-session-managed
+# session of the same user. It is started by regolith-session-x11-launch
+# when that session is already running; detect it here too for logins that
+# reach this script directly, unless this process is the primary session's
+# own systemd service. An additional session has no gnome-session or
+# systemd session units of its own: it must not register with the first
+# session's SessionManager, signal its notify socket, or touch the shared
+# user manager environment that records the first session.
+REGOLITH_X11_EXTRA_SESSION="${REGOLITH_X11_EXTRA_SESSION-}"
+if [ -z "$REGOLITH_X11_EXTRA_SESSION" ] && [ -z "${NOTIFY_SOCKET-}" ] \
+   && [ -z "${DESKTOP_AUTOSTART_ID-}" ] \
+   && regolith_x11_primary_session_active; then
+    REGOLITH_X11_EXTRA_SESSION=1
+    export REGOLITH_X11_EXTRA_SESSION
+fi
+if [ -n "$REGOLITH_X11_EXTRA_SESSION" ]; then
+    regolith_x11_restore_primary_session_env || :
+    unset NOTIFY_SOCKET DESKTOP_AUTOSTART_ID
+fi
+regolith_x11_register_running_session || :
+
 # Check if NOTIFY_SOCKET is available. This is used as a
 # test to see if the session uses systemd
-if [ -z "${NOTIFY_SOCKET-}" ]; then
+if [ -n "$REGOLITH_X11_EXTRA_SESSION" ]; then
+  # Add the environment.d variables the login environment does not set
+  import_environment_d
+elif [ -z "${NOTIFY_SOCKET-}" ]; then
   # Register with gnome-session so that it does not kill the whole session thinking it is dead.
   # When gnome-session respawns us after i3 crashed, the client is still
   # registered and this fails with AlreadyRegistered; i3 must start anyway.
@@ -30,7 +54,13 @@ if [ -z "${NOTIFY_SOCKET-}" ]; then
 fi
 
 # --------- Script Main -----------
-clear_wm_sockets    # SWAYSOCK and I3SOCK of an earlier session
+if [ -n "$REGOLITH_X11_EXTRA_SESSION" ]; then
+    # SWAYSOCK and I3SOCK of the first session, in this process only: the
+    # user manager still records the first session's sockets.
+    clear_wm_sockets_local
+else
+    clear_wm_sockets    # SWAYSOCK and I3SOCK of an earlier session
+fi
 
 gdm3_xrdb_fixup     # Remove when https://bugs.launchpad.net/ubuntu/+source/gdm3/+bug/1955850 is fixed
 load_i3_resources   # ~/.Xresources, ~/.config/regolith3/Xresources and the look, as 'regolith-look refresh' does
@@ -49,6 +79,19 @@ if [ ! -e "$UPDATE_FLAG_DIR" ]; then
         # 'regolith-look refresh' or 'regolith-look set' apply it again
         mkdir -p "$UPDATE_FLAG_DIR"
     fi
+fi
+
+if [ -n "$REGOLITH_X11_EXTRA_SESSION" ]; then
+    # The default logout program talks to org.gnome.SessionManager on the
+    # shared user bus, which is the first session's manager: logging out
+    # here would end that session. In an additional session, logging out
+    # exits this session's own i3 instead, which ends this script and so
+    # this logind session only. A logout program the user chose is kept.
+    case "$($RESOURCE_GETTER wm.program.logout "/usr/bin/gnome-session-quit --logout" 2>/dev/null || :)" in
+        "/usr/bin/gnome-session-quit --logout"|"/usr/bin/gnome-session-quit"|"gnome-session-quit --logout"|"gnome-session-quit")
+            printf 'wm.program.logout: i3-msg exit\n' | xrdb -nocpp -merge
+            ;;
+    esac
 fi
 
 resolve_default_config_file

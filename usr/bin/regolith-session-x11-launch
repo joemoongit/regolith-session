@@ -3,6 +3,17 @@ set -Eeu -o pipefail
 
 SESSION_TYPE="regolith-x11"
 
+# Common helpers for session state: which of this user's sessions is the
+# primary, gnome-session-managed one, and the user manager record it owns.
+# Sourced without -u: it also names the session's $HOME files, which this
+# launcher does not use.
+if [ -f /usr/lib/regolith/regolith-session-common.sh ]; then
+    set +u
+    # shellcheck disable=SC1091
+    source /usr/lib/regolith/regolith-session-common.sh
+    set -u
+fi
+
 if [ -z "${XDG_CURRENT_DESKTOP-}" ]; then
     export XDG_CURRENT_DESKTOP="Regolith:GNOME-Flashback:GNOME"
 fi
@@ -16,13 +27,43 @@ case ":${XDG_CONFIG_DIRS-}:" in
     *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-$SESSION_TYPE:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
 esac
 
+# A second gnome-session for the same user cannot run next to the first:
+# gnome-session, its systemd user targets and services, and the SessionManager
+# on the user bus exist once per user, so the new login ends at once and the
+# display manager shows its greeter again; starting it would also upload this
+# login's DISPLAY and XAUTHORITY over the first session's in the shared user
+# manager. When a primary session of this user is already running, start an
+# additional standalone session instead: regolith-session-x11 with its own i3
+# on this login's display, as this process, so that the logind session stays
+# open while i3 runs and ends when that session's i3 exits. Additional
+# sessions of other users use their own user managers and are unaffected.
+if command -v regolith_x11_primary_session_active > /dev/null 2>&1 \
+   && regolith_x11_primary_session_active; then
+    # Undo any upload of this login's DISPLAY or XAUTHORITY over the first
+    # session's shared record; this session keeps its own values itself.
+    regolith_x11_restore_primary_session_env || :
+    export REGOLITH_X11_EXTRA_SESSION=1
+    # No systemd session service or gnome-session owns this session: do not
+    # signal the first session's notify socket or session manager.
+    unset NOTIFY_SOCKET DESKTOP_AUTOSTART_ID
+    exec regolith-session-x11 "$@"
+fi
+
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     source /etc/os-release
 
     if [[ "${VERSION_CODENAME-}" == "jammy" || "${VERSION_CODENAME-}" == "bookworm" ]]; then
+        # Recorded so later logins can find this primary session even
+        # without its systemd units, and can restore its record.
+        if command -v regolith_x11_record_primary_session > /dev/null 2>&1; then
+            regolith_x11_record_primary_session || :
+        fi
         exec gnome-session --builtin --session=$SESSION_TYPE --disable-acceleration-check "$@"
     fi
 fi
 
+if command -v regolith_x11_record_primary_session > /dev/null 2>&1; then
+    regolith_x11_record_primary_session || :
+fi
 exec gnome-session --session=$SESSION_TYPE --disable-acceleration-check "$@"
