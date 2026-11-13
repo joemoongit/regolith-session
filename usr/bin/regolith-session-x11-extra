@@ -1,0 +1,182 @@
+#!/bin/bash
+# Extra Regolith X11 session for concurrent LightDM logins.
+#
+# The first login of a user goes through gnome-session and the systemd user
+# manager, as before. A second or later login cannot: gnome-session's systemd
+# target is a per-user singleton already used by the first session, so that
+# login would end back at LightDM. This script runs those extra logins as
+# standalone sessions instead: it loads the same X resources and look and runs
+# the user's own i3 on this login's own display, without gnome-session and
+# without talking to the systemd user manager at all. There is no fixed limit
+# on how many run at once, for one user or for several.
+#
+# It leaves the first session alone: the DISPLAY, XAUTHORITY and I3SOCK the
+# user manager recorded for it are never changed here, and logging out from
+# here (Super+Shift+E, which runs i3-msg exit on this display) ends only this
+# session.
+
+set -Eeu -o pipefail
+
+source /usr/lib/regolith/regolith-session-common.sh
+
+EXTRA_SESSION_TYPE="regolith-x11"
+
+# This script only ever runs as an extra session. The launcher sets the marker
+# before re-executing under a private bus; set it as well for direct runs.
+export REGOLITH_X11_EXTRA_SESSION=1
+
+if [ -z "${XDG_CURRENT_DESKTOP-}" ]; then
+    export XDG_CURRENT_DESKTOP="Regolith:GNOME-Flashback:GNOME"
+fi
+
+case ":${XDG_CONFIG_DIRS-}:" in
+    *":/etc/xdg/xdg-$EXTRA_SESSION_TYPE:"*) ;;
+    *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-$EXTRA_SESSION_TYPE:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
+esac
+
+# A private session bus keeps this session's logout, activation environment
+# and settings from reaching the first session on the shared bus. The launcher
+# normally re-executes here under dbus-run-session already; re-enter it when
+# this script is run directly on the shared bus.
+regolith_extra_on_shared_bus() {
+    # The shared user bus is $XDG_RUNTIME_DIR/bus (/run/user/<uid>/bus), as is
+    # the default when the variable is unset. dbus-run-session uses a private
+    # path under /tmp instead.
+    local addr="${DBUS_SESSION_BUS_ADDRESS-}"
+    if [ -z "$addr" ]; then
+        return 0
+    fi
+    if [ -n "${XDG_RUNTIME_DIR-}" ]; then
+        case "$addr" in
+            *"$XDG_RUNTIME_DIR/bus"*) return 0 ;;
+        esac
+    fi
+    case "$addr" in
+        */run/user/*/bus*) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+if regolith_extra_on_shared_bus && command -v dbus-run-session >/dev/null 2>&1; then
+    exec dbus-run-session -- /usr/bin/regolith-session-x11-extra "$@"
+fi
+
+# Never talk to the systemd user manager from an extra session: no
+# import-environment, set-environment, unset-environment, is-active or start.
+# Unset the notification socket so nothing here notifies the real manager and
+# the session takes the non-systemd path below.
+unset NOTIFY_SOCKET LISTEN_PID LISTEN_FDS LISTEN_FDNAMES INVOCATION_ID JOURNAL_STREAM 2>/dev/null || true
+
+# Logout from an extra session must end only it. i3's logout binding runs
+# wm.program.logout; point it at this display's own i3 below. A wrapper for
+# gnome-session-quit earlier in PATH catches direct calls as well.
+EXTRA_BIN_DIR="/usr/lib/regolith/x11-extra/bin"
+if [ -d "$EXTRA_BIN_DIR" ]; then
+    case ":${PATH-}:" in
+        *":$EXTRA_BIN_DIR:"*) ;;
+        *) export PATH="$EXTRA_BIN_DIR:${PATH-}" ;;
+    esac
+fi
+
+# Add the environment.d variables the login environment does not set, as the
+# non-systemd login path does. The login environment (DISPLAY, XAUTHORITY and
+# the rest LightDM set for this display) wins.
+import_environment_d
+
+# Drop the IPC socket variables of an earlier session locally only. The user
+# manager keeps the first session's I3SOCK: unsetting it there would break that
+# session, and i3 sets what it needs for this display itself.
+unset I3SOCK SWAYSOCK || true
+
+gdm3_xrdb_fixup() {
+    if xrescat testkey defaultval > /dev/null 2>&1; then
+        echo "xrdb appears to be property initialized, skipping xrdb init"
+    else
+        echo "xrdb appears to not be running. Manually initializing.."
+
+        load_system_xres
+    fi
+}
+
+# --------- Script Main -----------
+gdm3_xrdb_fixup     # Remove when https://bugs.launchpad.net/ubuntu/+source/gdm3/+bug/1955850 is fixed
+
+# The look and workspace setup exactly as the ordinary login builds them, on
+# this display only (xrdb is per X server). gsd-xsettings only publishes for
+# the first session's display, so there is no text-scaling-factor round trip
+# here: the Xft.dpi from the files below stays in this display's resources.
+load_standard_xres # ~/.Xresources
+load_regolith_xres # ~/.config/regolith3/Xresources and the look
+xres_i3_cleanup    # Single-quote workspace names for i3
+
+UPDATE_FLAG_DIR="$HOME/.config/regolith3/flags"
+if [ ! -e "$UPDATE_FLAG_DIR" ]; then
+    # flag file has not been created, meaning this is first session load
+    # in this case, we need to configure some desktop settings from the look
+    LOADER_PATH="$($RESOURCE_GETTER regolith.look.loader)"
+    if [ -n  "$LOADER_PATH" ]; then
+        # Load the look-specific script that has a function called load_look()
+        # shellcheck disable=SC1090
+        source "$LOADER_PATH"
+        # Call look function to update UI
+        load_look
+        # Apply the look only once: later logins keep the user's settings,
+        # 'regolith-look refresh' or 'regolith-look set' apply it again
+        mkdir -p "$UPDATE_FLAG_DIR"
+    fi
+fi
+
+# Super+Shift+E runs wm.program.logout. In the ordinary session that is
+# gnome-session-quit --logout; here it must exit only this display's i3.
+# xrdb is per display, so the first session keeps its own logout command.
+if [ -n "${DISPLAY-}" ] && command -v xrdb >/dev/null 2>&1; then
+    printf 'wm.program.logout: i3-msg exit\n' | xrdb -merge 2>/dev/null || true
+fi
+
+# The systemd service loads ~/.config/regolith3/i3/env into the session. Do
+# the same here for settings the user keeps there, without letting it replace
+# what the login set for this display.
+if [ -f "$HOME/.config/regolith3/i3/env" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+        case "$line" in
+            ''|'#'*) continue ;;
+            *=*) ;;
+            *) continue ;;
+        esac
+        name=${line%%=*}
+        case "$name" in
+            DISPLAY|XAUTHORITY|I3SOCK|SWAYSOCK) continue ;;
+        esac
+        [[ "$name" =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] || continue
+        if [ -z "${!name+set}" ]; then
+            # Values in EnvironmentFile are plain KEY=value, without quoting.
+            export "$name=${line#*=}"
+        fi
+    done < "$HOME/.config/regolith3/i3/env"
+fi
+
+resolve_default_config_file
+echo "Regolith is launching i3 with $I3_CONFIG_FILE (extra session on ${DISPLAY-})"
+
+# i3's config ends with: [ -z "${NOTIFY_SOCKET-}" ] &&
+# systemctl --user start regolith-x11.target || systemd-notify --ready.
+# A dummy socket keeps it from calling systemctl --user, which would touch the
+# first session; the notify to a path that is never a socket fails silently.
+_extra_display="${DISPLAY-unknown}"
+_extra_display="${_extra_display#:}"
+export NOTIFY_SOCKET="/tmp/regolith-x11-extra-notify-${_extra_display}.sock"
+
+set +e
+i3 -c "$I3_CONFIG_FILE"
+i3_status=$?
+set -e
+unset NOTIFY_SOCKET || true
+
+# Run the user's post-logout script. The first session runs it through
+# regolith-post-logout.service when its target stops; without systemd it runs
+# here, as in the non-systemd login path.
+if [ -f "$USER_POST_LOGOUT_SCRIPT_FILE" ] ; then
+    echo "Regolith is launching user post-logout file $USER_POST_LOGOUT_SCRIPT_FILE"
+    timeout --verbose 5 bash "$USER_POST_LOGOUT_SCRIPT_FILE" || true
+fi
+
+exit "$i3_status"

@@ -16,6 +16,13 @@ case ":${XDG_CONFIG_DIRS-}:" in
     *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-$SESSION_TYPE:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
 esac
 
+# Extra sessions re-enter here under a private session bus (see below) with
+# REGOLITH_X11_EXTRA_SESSION set. Run the standalone session, never
+# gnome-session: the systemd user manager already hosts the first session.
+if [ -n "${REGOLITH_X11_EXTRA_SESSION-}" ]; then
+    exec /usr/bin/regolith-session-x11-extra "$@"
+fi
+
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     source /etc/os-release
@@ -23,6 +30,97 @@ if [ -f /etc/os-release ]; then
     if [[ "${VERSION_CODENAME-}" == "jammy" || "${VERSION_CODENAME-}" == "bookworm" ]]; then
         exec gnome-session --builtin --session=$SESSION_TYPE --disable-acceleration-check "$@"
     fi
+fi
+
+# True when this user already runs a Regolith X11 session: the systemd-managed
+# first session (its units are active) or any earlier extra session (its i3 or
+# session script runs, without systemd units). Per-user, per-display, with no
+# fixed limit. Used only on releases whose gnome-session needs systemd.
+regolith_x11_has_existing_session() {
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl --user is-active --quiet regolith-x11.service 2>/dev/null; then
+            [ -n "${REGOLITH_X11_DEBUG-}" ] && echo "regolith-x11-launch: existing regolith-x11.service" >&2 || true
+            return 0
+        fi
+        if systemctl --user is-active --quiet "gnome-session@regolith-x11.target" 2>/dev/null; then
+            [ -n "${REGOLITH_X11_DEBUG-}" ] && echo "regolith-x11-launch: existing gnome-session@regolith-x11.target" >&2 || true
+            return 0
+        fi
+        if systemctl --user is-active --quiet regolith-x11.target 2>/dev/null; then
+            [ -n "${REGOLITH_X11_DEBUG-}" ] && echo "regolith-x11-launch: existing regolith-x11.target" >&2 || true
+            return 0
+        fi
+    fi
+
+    local uid
+    uid="$(id -u 2>/dev/null || echo "${UID-}")"
+    if [ -z "$uid" ]; then
+        return 1
+    fi
+
+    # This user's processes, read directly from /proc so unrelated commands
+    # that merely mention the session (editors, greps) never count. Matches the
+    # first session's gnome-session (exact process name plus the session name
+    # in its arguments), any session's i3 (exact process name), and any
+    # session's script (a shell running exactly the session script, never this
+    # launcher and never its Xsession parents).
+    local proc pid owner comm cmdline
+    for proc in /proc/[0-9]*; do
+        pid="${proc#/proc/}"
+        [ "$pid" = "$$" ] && continue
+        owner="$(stat -c %u "$proc" 2>/dev/null || echo no)"
+        [ "$owner" = "$uid" ] || continue
+        comm="$(cat "$proc/comm" 2>/dev/null || true)"
+        [ -n "$comm" ] || continue
+        if [ "$comm" = "i3" ]; then
+            [ -n "${REGOLITH_X11_DEBUG-}" ] && echo "regolith-x11-launch: existing i3 pid $pid" >&2 || true
+            return 0
+        fi
+        case "$comm" in
+            gnome-session*)
+                cmdline="$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)"
+                case "$cmdline" in
+                    *regolith-x11*)
+                        [ -n "${REGOLITH_X11_DEBUG-}" ] && echo "regolith-x11-launch: existing gnome-session pid $pid: $cmdline" >&2 || true
+                        return 0
+                        ;;
+                esac
+                ;;
+        esac
+        case "$comm" in
+            bash|sh|dash)
+                cmdline="$(tr '\0' ' ' < "$proc/cmdline" 2>/dev/null || true)"
+                case "$cmdline" in
+                    *" /usr/bin/regolith-session-x11 "*|*" /usr/bin/regolith-session-x11"|\
+                    *" /usr/bin/regolith-session-x11-extra "*|*" /usr/bin/regolith-session-x11-extra"|\
+                    *" regolith-session-x11 "*|*" regolith-session-x11"|\
+                    *" regolith-session-x11-extra "*|*" regolith-session-x11-extra")
+                        [ -n "${REGOLITH_X11_DEBUG-}" ] && echo "regolith-x11-launch: existing session script pid $pid: $cmdline" >&2 || true
+                        return 0
+                        ;;
+                esac
+                ;;
+        esac
+    done
+
+    return 1
+}
+
+# A second or later login cannot go through gnome-session: its systemd target
+# is a per-user singleton already used by the first session, so the login
+# would end back at LightDM. Instead run a standalone session on this login's
+# own display, under a private session bus so its logout and settings leave
+# the first session alone. The private bus also keeps this login's DISPLAY
+# and XAUTHORITY out of the shared activation environment.
+if regolith_x11_has_existing_session; then
+    if [ -x /usr/bin/regolith-session-x11-extra ]; then
+        export REGOLITH_X11_EXTRA_SESSION=1
+        if command -v dbus-run-session >/dev/null 2>&1; then
+            exec dbus-run-session -- /usr/bin/regolith-session-x11-launch "$@"
+        fi
+        exec /usr/bin/regolith-session-x11-extra "$@"
+    fi
+    # Without the extra runner, fall through to gnome-session as before.
 fi
 
 exec gnome-session --session=$SESSION_TYPE --disable-acceleration-check "$@"

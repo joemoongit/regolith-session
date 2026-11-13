@@ -1,0 +1,28 @@
+#!/bin/bash
+# gnome-session-quit for extra Regolith X11 sessions.
+#
+# Extra sessions (see regolith-session-x11-extra) run without gnome-session on
+# a private session bus. A plain --logout there, as Regolith's logout shortcut
+# (Super+Shift+E) runs it, must exit only this session's own i3 on this
+# display, and must never reach the first session's SessionManager on the
+# shared bus. Anything else goes to the real gnome-session-quit, which on the
+# private bus fails safely without touching any other session.
+set -Eeu -o pipefail
+
+if [ "${REGOLITH_X11_EXTRA_SESSION-}" = "1" ]; then
+    want_logout=0
+    want_reboot=0
+    want_poweroff=0
+    for arg in "$@"; do
+        case "$arg" in
+            --logout) want_logout=1 ;;
+            --reboot) want_reboot=1 ;;
+            --power-off|--poweroff) want_poweroff=1 ;;
+        esac
+    done
+    if [ "$want_logout" = 1 ] && [ "$want_reboot" = 0 ] && [ "$want_poweroff" = 0 ]; then
+        exec i3-msg exit
+    fi
+fi
+
+exec /usr/bin/gnome-session-quit "$@"

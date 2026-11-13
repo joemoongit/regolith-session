@@ -1,0 +1,220 @@
+#!/bin/sh
+# Extra Regolith X11 sessions for concurrent LightDM logins (X11 only).
+#
+# The first login of a user goes through gnome-session as before. A second or
+# later login cannot use its per-user systemd target again, so it must run a
+# standalone session instead: its own i3 on its own display, without touching
+# the DISPLAY, XAUTHORITY and I3SOCK the user manager recorded for the first
+# session, and logging out from it must end only it. There is no fixed limit.
+#  1. With no session running, the launcher execs gnome-session.
+#  2. With a session running, it runs the extra session (its own i3, own
+#     display) without calling gnome-session and without changing the user
+#     manager environment. Runs three extras on three displays.
+#  3. The extra session clears stale I3SOCK/SWAYSOCK locally, keeps the look
+#     and workspace setup, and points its logout at its own i3.
+#  4. gnome-session-quit --logout in an extra session exits only that i3.
+set -eu
+
+tmp=${AUTOPKGTEST_TMP:-$(mktemp -d)}
+fail=0
+ok() { echo "ok: $1"; }
+FAIL() { echo "FAIL: $1"; fail=1; }
+
+# 0. Installed files.
+for f in /usr/bin/regolith-session-x11-launch \
+         /usr/bin/regolith-session-x11-extra \
+         /usr/lib/regolith/x11-extra/bin/gnome-session-quit; do
+    if [ -x "$f" ]; then
+        ok "$f is installed and executable"
+    else
+        FAIL "$f is missing or not executable"
+    fi
+done
+if grep -q 'regolith-session-x11-extra' /usr/bin/regolith-session-x11-launch \
+   && grep -q 'dbus-run-session' /usr/bin/regolith-session-x11-launch; then
+    ok "launcher branches to the extra session"
+else
+    FAIL "launcher does not branch to the extra session"
+fi
+# No fixed display hard-coded into the branching: three extras on three
+# displays below prove it, and the launcher mentions no :0/:1.
+if grep -v '^#' /usr/bin/regolith-session-x11-launch | grep -Eq ':[0-9]'; then
+    FAIL "launcher hard-codes a display number"
+else
+    ok "launcher hard-codes no display number"
+fi
+
+export HOME="$tmp/home" XDG_RUNTIME_DIR="$tmp/xdg"
+mkdir -p "$HOME/.config/regolith3/flags" "$XDG_RUNTIME_DIR" "$tmp/bin"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+# Stubs record their environment and arguments; i3 exits at once.
+cat > "$tmp/bin/i3" <<'EOF'
+#!/bin/sh
+echo "$@" > "$AUTOPKGTEST_TMP/i3.args.$I3_RUN"
+env > "$AUTOPKGTEST_TMP/i3.env.$I3_RUN"
+exit 0
+EOF
+cat > "$tmp/bin/i3-msg" <<'EOF'
+#!/bin/sh
+echo "$@" >> "$AUTOPKGTEST_TMP/i3-msg.calls"
+env | grep '^DISPLAY=' >> "$AUTOPKGTEST_TMP/i3-msg.calls" || true
+exit 0
+EOF
+cat > "$tmp/bin/gnome-session" <<'EOF'
+#!/bin/sh
+echo "$@" > "$AUTOPKGTEST_TMP/gnome-session.args"
+exit 0
+EOF
+chmod +x "$tmp/bin/i3" "$tmp/bin/i3-msg" "$tmp/bin/gnome-session"
+
+# Three X servers, three displays, three extra sessions: no fixed limit of one.
+for n in 1 2 3; do
+    Xvfb -displayfd 3 -screen 0 1280x800x24 -nolisten tcp -noreset \
+        3>"$tmp/display$n" >"$tmp/xvfb$n.log" 2>&1 &
+    echo $! > "$tmp/xvfb$n.pid"
+done
+trap 'for p in "$tmp"/xvfb*.pid; do kill "$(cat "$p")" 2>/dev/null || true; done' EXIT
+for n in 1 2 3; do
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$tmp/display$n" ] && break; sleep 0.5; done
+    if [ ! -s "$tmp/display$n" ]; then
+        FAIL "Xvfb $n did not start"; cat "$tmp/xvfb$n.log" || true; exit $fail
+    fi
+done
+d1=$(cat "$tmp/display1") d2=$(cat "$tmp/display2") d3=$(cat "$tmp/display3")
+
+# 1. Fresh login with no session running goes through gnome-session exactly as
+# before. pgrep finds no i3 and systemctl finds no active Regolith units here.
+rm -f "$tmp/gnome-session.args"
+AUTOPKGTEST_TMP="$tmp" PATH="$tmp/bin:$PATH" REGOLITH_X11_DEBUG=1 \
+    XDG_SESSION_TYPE=x11 DISPLAY=":$d1" \
+    XDG_CURRENT_DESKTOP=Regolith:GNOME-Flashback:GNOME \
+    timeout 30 regolith-session-x11-launch >"$tmp/fresh.log" 2>&1 || true
+if [ -f "$tmp/gnome-session.args" ] \
+   && grep -q -- '--session=regolith-x11' "$tmp/gnome-session.args"; then
+    ok "fresh login starts through gnome-session --session=regolith-x11"
+else
+    FAIL "fresh login did not exec gnome-session --session=regolith-x11"
+    cat "$tmp/fresh.log" || true
+fi
+
+# 2. Extra logins while a session is running. A stubbed systemctl reports the
+# first session's units active and records every call; the extras must only
+# ever ask is-active, never change the user manager environment.
+cat > "$tmp/bin/systemctl" <<'EOF'
+#!/bin/sh
+echo "$*" >> "$AUTOPKGTEST_TMP/systemctl.calls"
+if [ "$1" = "--user" ] && [ "$2" = "is-active" ]; then
+    shift 3
+    for u in "$@"; do
+        case "$u" in
+            regolith-x11.service|gnome-session@regolith-x11.target|regolith-x11.target)
+                exit 0 ;;
+        esac
+    done
+fi
+exit 1
+EOF
+chmod +x "$tmp/bin/systemctl"
+rm -f "$tmp/systemctl.calls" "$tmp/gnome-session.args" "$tmp/i3-msg.calls"
+touch "$tmp/systemctl.calls"
+
+run_extra() { # run_extra <run> <display> <i3sock>
+    rm -f "$tmp/i3.args.$1" "$tmp/i3.env.$1"
+    AUTOPKGTEST_TMP="$tmp" PATH="$tmp/bin:$PATH" I3_RUN="$1" REGOLITH_X11_DEBUG=1 \
+        XDG_SESSION_TYPE=x11 DISPLAY=":$2" XAUTHORITY="$tmp/xauth$1" \
+        I3SOCK="$3" SWAYSOCK="$3" \
+        XDG_CURRENT_DESKTOP=Regolith:GNOME-Flashback:GNOME \
+        timeout 60 regolith-session-x11-launch >"$tmp/extra$1.log" 2>&1 \
+        || { cat "$tmp/extra$1.log"; return 1; }
+}
+
+stale="$XDG_RUNTIME_DIR/sway-ipc.1000.4242.sock"
+run_extra 1 "$d1" "$stale" || FAIL "extra login 1 did not complete"
+run_extra 2 "$d2" "$stale" || FAIL "extra login 2 did not complete"
+run_extra 3 "$d3" "$stale" || FAIL "extra login 3 did not complete"
+
+if [ -f "$tmp/gnome-session.args" ]; then
+    FAIL "extra login called gnome-session: $(cat "$tmp/gnome-session.args")"
+else
+    ok "extra logins do not go through gnome-session"
+fi
+
+for n in 1 2 3; do
+    d=$(cat "$tmp/display$n")
+    if [ ! -f "$tmp/i3.env.$n" ]; then
+        FAIL "extra $n: its i3 did not run"; cat "$tmp/extra$n.log" || true; continue
+    fi
+    got=$(sed -n 's/^DISPLAY=//p' "$tmp/i3.env.$n")
+    if [ "$got" = ":$d" ]; then
+        ok "extra $n: its own i3 on its own display :$d"
+    else
+        FAIL "extra $n: i3 DISPLAY is '$got', expected ':$d'"
+    fi
+    for var in I3SOCK SWAYSOCK; do
+        if grep -q "^$var=" "$tmp/i3.env.$n"; then
+            FAIL "extra $n: i3 started with stale $(grep "^$var=" "$tmp/i3.env.$n")"
+        else
+            ok "extra $n: i3 started without stale $var"
+        fi
+    done
+    if grep -q '^NOTIFY_SOCKET=.*regolith-x11-extra-notify' "$tmp/i3.env.$n"; then
+        ok "extra $n: i3 kept from systemctl --user by a dummy NOTIFY_SOCKET"
+    else
+        FAIL "extra $n: i3 lacks the dummy NOTIFY_SOCKET: $(grep '^NOTIFY_SOCKET=' "$tmp/i3.env.$n" || echo unset)"
+    fi
+    if grep -q '^REGOLITH_X11_EXTRA_SESSION=1$' "$tmp/i3.env.$n" \
+       && sed -n 's/^PATH=//p' "$tmp/i3.env.$n" | grep -q '/usr/lib/regolith/x11-extra/bin'; then
+        ok "extra $n: marked as an extra session with the logout wrapper in PATH"
+    else
+        FAIL "extra $n: missing the extra-session marker or wrapper PATH"
+    fi
+    if DISPLAY=":$d" xrdb -query 2>/dev/null | grep -q '^wm\.program\.logout:.*i3-msg exit'; then
+        ok "extra $n: logout points at its own i3"
+    else
+        FAIL "extra $n: wm.program.logout is not i3-msg exit: $(DISPLAY=":$d" xrdb -query 2>/dev/null | grep 'wm.program.logout' || echo unset)"
+    fi
+done
+
+# The user manager environment is untouched: only is-active probes, no
+# set/unset/import of DISPLAY, XAUTHORITY or I3SOCK and no target start.
+if grep -v 'is-active' "$tmp/systemctl.calls" | grep -q .; then
+    FAIL "extra logins talked to the user manager beyond is-active:"
+    grep -v 'is-active' "$tmp/systemctl.calls" || true
+else
+    ok "extra logins leave the user manager environment alone"
+fi
+if grep -E 'unset-environment|set-environment|import-environment' "$tmp/systemctl.calls" \
+        | grep -Eq 'DISPLAY|XAUTHORITY|I3SOCK'; then
+    FAIL "extra logins changed DISPLAY, XAUTHORITY or I3SOCK in the user manager"
+else
+    ok "DISPLAY, XAUTHORITY and I3SOCK for the first session are untouched"
+fi
+
+# Look and workspace setup as the ordinary login builds them.
+if DISPLAY=":$d1" xrdb -query 2>/dev/null | grep -q 'regolith\.look\.path\|regolith\.workspace\.\|wm\.workspace\.'; then
+    ok "extra session keeps the look and workspace resources"
+else
+    FAIL "extra session lost the look or workspace resources"
+    DISPLAY=":$d1" xrdb -query 2>/dev/null | head -n 20 || true
+fi
+if DISPLAY=":$d1" xrdb -query 2>/dev/null | grep 'wm\.workspace\..*\.name' | grep -q '"'; then
+    FAIL "extra session left double quotes in workspace names for i3"
+else
+    ok "extra session leaves workspace names quoted for i3"
+fi
+
+# 4. Logging out from inside an extra session ends only it.
+rm -f "$tmp/i3-msg.calls"
+REGOLITH_X11_EXTRA_SESSION=1 AUTOPKGTEST_TMP="$tmp" \
+    PATH="$tmp/bin:/usr/lib/regolith/x11-extra/bin:$PATH" DISPLAY=":$d2" \
+    gnome-session-quit --logout
+if grep -q '^exit$' "$tmp/i3-msg.calls" \
+   && grep -q "^DISPLAY=:$d2$" "$tmp/i3-msg.calls"; then
+    ok "logout from an extra session exits only its own i3 on :$d2"
+else
+    FAIL "logout from an extra session did not run i3-msg exit on :$d2"
+    cat "$tmp/i3-msg.calls" 2>/dev/null || echo "(i3-msg was not called)"
+fi
+
+exit $fail
