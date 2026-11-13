@@ -111,6 +111,20 @@ other_graphical_sessions() {
     done < <(loginctl list-sessions --no-legend 2>/dev/null)
 }
 
+# This user's other live multisession sessions, those started from a text
+# console included (logind calls those tty sessions)
+other_multisession_sessions() {
+    local f id
+    for f in "${XDG_RUNTIME_DIR:-/nonexistent}"/multisession/*/state; do
+        [[ -f $f ]] || continue
+        id=${f%/state}; id=${id##*/}
+        [[ $id != "${XDG_SESSION_ID:-}" ]] || continue
+        loginctl show-session "$id" -p State --value 2>/dev/null | grep -qE '^(active|online)$' \
+            && printf '%s\n' "$id"
+    done
+    return 0
+}
+
 # Graphical sessions of this user that use the user manager and user bus:
 # all of them except standalone multisession sessions, which keep to their
 # own bus.
@@ -151,6 +165,20 @@ restore_session_identity() {
     for var in XDG_CONFIG_DIRS XDG_DATA_DIRS; do
         if [[ ${!var:-} == *"$key"* ]]; then export "$var=${!var//$key/$name}"; fi
     done
+}
+
+# Started without a display manager ('start', from a text console): give the
+# session the names a display manager takes from its entry.
+default_session_identity() { # <session> <desktop file>
+    local names
+    export DESKTOP_SESSION=${DESKTOP_SESSION:-$1} XDG_SESSION_DESKTOP=${XDG_SESSION_DESKTOP:-$1}
+    if [[ -z ${XDG_CURRENT_DESKTOP:-} ]]; then
+        names=$(desktop_get "$2" DesktopNames)
+        names=${names%;}
+        export XDG_CURRENT_DESKTOP=${names//;/:}
+        [[ -n $XDG_CURRENT_DESKTOP ]] || unset XDG_CURRENT_DESKTOP
+    fi
+    if [[ -n ${DISPLAY:-} && ${XDG_SESSION_TYPE:-tty} == tty ]]; then export XDG_SESSION_TYPE=x11; fi
 }
 
 prepend_path_var() { # <var> <dir>
@@ -248,6 +276,30 @@ cmd_new() {
     seat=${seat##*/}
     log "asking LightDM for a new greeter on $seat"
     XDG_SEAT_PATH=/org/freedesktop/DisplayManager/$seat dm-tool switch-to-greeter
+    if [[ -n $(other_graphical_sessions) || ${XDG_SESSION_TYPE:-} == x11 ]]; then
+        echo "regolith-multisession: logging in as $MS_USER at the new greeter returns to $MS_USER's" \
+            "running session (LightDM does that for a user who has one). For another session" \
+            "of $MS_USER, log in on a text console (Ctrl+Alt+F3) and run: regolith-multisession start" >&2
+    fi
+}
+
+# regolith-multisession start [<session>]: from a text console, start another
+# session of this user on this VT. LightDM can't: logging in at its greeter
+# as a user who has a session on the seat switches back to that session.
+cmd_start() {
+    local name=${1:-regolith-x11} tty n
+    command -v startx >/dev/null 2>&1 || die "startx not found (package xinit)"
+    tty=$(tty 2>/dev/null) || :
+    [[ $tty == /dev/tty[0-9]* ]] || die "run 'regolith-multisession start' on a text console (Ctrl+Alt+F3), not on ${tty:-no terminal}"
+    for ((n = 0; n < 64; n++)); do
+        [[ -e /tmp/.X$n-lock || -e /tmp/.X11-unix/X$n ]] || break
+    done
+    ((n < 64)) || die "no free X display"
+    # Always standalone: it's an extra session, and a session started from a
+    # console never owns the user manager's graphical session
+    export MULTISESSION_ISOLATE=1
+    log "starting $name on :$n, vt ${tty#/dev/tty}"
+    exec startx "$MS_BIN" launch "$name" -- ":$n" "vt${tty#/dev/tty}"
 }
 
 # regolith-multisession launch <session>: the Exec of a multi-session entry.
@@ -257,10 +309,11 @@ cmd_launch() {
     load_profile "$name"
     restore_session_identity "$name"
     desktop=$(find_desktop "$name" "${XSESSION_DIRS[@]}") || die "no session '$name' in ${XSESSION_DIRS[*]}"
+    default_session_identity "$name" "$desktop"
 
     local mode=primary
     if should_isolate; then mode=standalone; fi
-    instances=$(other_graphical_sessions | wc -l)
+    instances=$( { other_graphical_sessions; other_multisession_sessions; } | sort -u | wc -l)
     export MULTISESSION_SESSION=$name MULTISESSION_MODE=$mode
     export MULTISESSION_INSTANCE=$((instances + 1)) MULTISESSION_RUNDIR
     MULTISESSION_RUNDIR=$(session_rundir)
@@ -358,17 +411,37 @@ spawn() {
 teardown() {
     trap '' TERM HUP INT EXIT
     log "ending standalone ${MULTISESSION_SESSION:-session} on ${DISPLAY:-?}"
-    local name
+    local name pid _ left
     for name in "${DISPLAY_SCOPED_PROCESSES[@]}"; do
         "$MS_SHIMDIR/pkill" -u "$(id -u)" -x "$name" 2>/dev/null || :
     done
     kill -TERM -- "-$$" 2>/dev/null || :
-    local pid _
+    for pid in $(session_pids); do kill -TERM "$pid" 2>/dev/null || :; done
     for _ in 1 2 3 4 5 6 7 8 9 10; do
-        command -p pgrep -g "$$" | grep -qvx "$$" || break
+        left=$( (command -p pgrep -g "$$"; session_pids) | grep -vx "$$") || :
+        [[ -n $left ]] || break
         sleep 0.2
     done
-    for pid in $(command -p pgrep -g "$$" | grep -vx "$$"); do kill -KILL "$pid" 2>/dev/null || :; done
+    for pid in $( (command -p pgrep -g "$$"; session_pids) | grep -vx "$$"); do kill -KILL "$pid" 2>/dev/null || :; done
+}
+
+# Processes this session started that left its process group (i3 runs its
+# exec children in sessions of their own; i3-swap-focus would wait for i3
+# forever): they carry the session's MULTISESSION_RUNDIR. The primary
+# session's systemd units get the same by cgroup. Not our ancestors, which
+# wait for us.
+session_pids() {
+    local pid ancestors=" " p=$$
+    while [[ $p -gt 1 ]]; do
+        ancestors+="$p "
+        p=$(awk '{ print $4 }' "/proc/$p/stat" 2>/dev/null) || break
+    done
+    for pid in $(command -p pgrep -u "$(id -u)"); do
+        [[ $ancestors != *" $pid "* ]] || continue
+        tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null \
+            | grep -qxF "MULTISESSION_RUNDIR=$MULTISESSION_RUNDIR" && printf '%s\n' "$pid"
+    done
+    return 0
 }
 
 # regolith-multisession should-isolate: exit 0 when this login must run standalone.
@@ -472,6 +545,8 @@ regolith-multisession $MS_VERSION: concurrent graphical sessions, several per us
 
   regolith-multisession new [--seat SeatN]  open one more LightDM greeter on the next free VT
                                             (use this instead of restarting LightDM)
+  regolith-multisession start [<session>]   on a text console: start another session of this
+                                            user on this VT (LightDM returns to the running one)
   regolith-multisession status              list the graphical sessions and their mode
   regolith-multisession doctor              check the installation and this user's sessions
   regolith-multisession entry <session>     print a multi-session entry for another session
@@ -485,6 +560,7 @@ main() {
     shift || :
     case $cmd in
         new) cmd_new "$@" ;;
+        start) cmd_start "$@" ;;
         launch) cmd_launch "$@" ;;
         _standalone) cmd__standalone "$@" ;;
         should-isolate) cmd_should_isolate "$@" ;;

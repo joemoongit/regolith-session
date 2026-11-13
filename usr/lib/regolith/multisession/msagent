@@ -414,6 +414,33 @@ def session_components(name):
     return []
 
 
+def session_target_services(name):
+    """Services that gnome-session@<name>.target pulls in besides the
+    components: gnome-session 49+ runs a session as that systemd target, and
+    regolith-session-flashback's drop-in adds the GNOME Flashback polkit
+    agent and idle monitor there (their autostart entries are gated on
+    GSettings keys that GNOME Flashback no longer has)."""
+    services = []
+    for d in SYSTEMD_USER_DIRS:
+        dropins = os.path.join(d, f"gnome-session@{name}.target.d")
+        if not os.path.isdir(dropins):
+            continue
+        for fname in sorted(os.listdir(dropins)):
+            if not fname.endswith(".conf"):
+                continue
+            section = None
+            with open(os.path.join(dropins, fname), encoding="utf-8", errors="replace") as fh:
+                for line in fh:
+                    line = line.strip()
+                    if line.startswith("["):
+                        section = line
+                    elif section == "[Unit]" and line.startswith("Wants="):
+                        for unit in line[len("Wants="):].split():
+                            if unit.endswith(".service") and unit[:-8] not in services:
+                                services.append(unit[:-8])
+    return services
+
+
 def autostart_condition(condition):
     """gnome-session's AutostartCondition, the kinds that matter on a desktop."""
     kind, _, arg = condition.strip().partition(" ")
@@ -488,7 +515,10 @@ def autostart_entries(skip):
 
 def cmd_plan(args):
     skip = {s for s in args.skip.split(",") if s}
-    for cid in session_components(args.gnome_session) if args.gnome_session else []:
+    components = []
+    if args.gnome_session:
+        components = session_components(args.gnome_session) + session_target_services(args.gnome_session)
+    for cid in components:
         if cid in skip:
             continue
         skip.add(cid)

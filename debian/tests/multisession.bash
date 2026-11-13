@@ -188,6 +188,8 @@ has() { grep -qxF "$1" <<<"$plan"; }
 expect "component from its desktop entry, field codes dropped" has "early	$F/comp-desktop --replace"
 if ((plan_unit_ok)); then
     expect "component from its systemd unit, prefix and %h handled" has "early	/usr/libexec/comp-unit --flag $HOME"
+    expect "service the session's systemd target wants" has "early	/usr/libexec/target-svc"
+    expect "... a component it also wants starts once" test "$(grep -c comp-unit <<<"$plan")" -eq 1
 fi
 expect "window manager component skipped" bash -c "! grep -q testde-wm <<<'$plan'"
 expect "unresolvable component logged" grep -q "comp-missing" "$T/plan.err"
@@ -197,7 +199,7 @@ expect "session XDG dir overrides /etc/xdg" has "late	$F/session-version"
 for gone in plain-app user-plain hidden disabled kde nottest /x cond dup system-version; do
     expect "autostart skips $gone" bash -c "! grep -q -- '$gone' <<<'$plan'"
 done
-expect "plan has exactly the expected entries" test "$(wc -l <<<"$plan")" -eq $((4 + plan_unit_ok)) || printf "%s\n" "$plan"
+expect "plan has exactly the expected entries" test "$(wc -l <<<"$plan")" -eq $((4 + 2 * plan_unit_ok)) || printf "%s\n" "$plan"
 
 # ---- a user bus, as the user's first session has it ---------------------------
 echo "# standalone sessions"
