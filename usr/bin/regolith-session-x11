@@ -5,6 +5,15 @@ set -Eeu -o pipefail
 
 source /usr/lib/regolith/regolith-session-common.sh
 
+# An additional session (REGOLITH_X11_ADDITIONAL_SESSION set by
+# regolith-session-x11-launch when a session of this user is already
+# running) has no gnome-session or systemd session units of its own. It
+# must not register with the running session's gnome-session, must not
+# change the systemd user environment that session recorded, and logs out
+# by ending its own i3 only.
+ADDITIONAL_SESSION="${REGOLITH_X11_ADDITIONAL_SESSION-}"
+unset REGOLITH_X11_ADDITIONAL_SESSION
+
 gdm3_xrdb_fixup() {
     if xrescat testkey defaultval > /dev/null 2>&1; then
         echo "xrdb appears to be property initialized, skipping xrdb init"
@@ -20,7 +29,9 @@ if [ -z "${NOTIFY_SOCKET-}" ]; then
   # Register with gnome-session so that it does not kill the whole session thinking it is dead.
   # When gnome-session respawns us after i3 crashed, the client is still
   # registered and this fails with AlreadyRegistered; i3 must start anyway.
-  if [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
+  # An additional session has no gnome-session to register with: the name
+  # on the shared session bus belongs to the already running session.
+  if [ -z "$ADDITIONAL_SESSION" ] && [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
       dbus-send --print-reply --session --dest=org.gnome.SessionManager "/org/gnome/SessionManager" org.gnome.SessionManager.RegisterClient "string:Regolith-X11" "string:$DESKTOP_AUTOSTART_ID" \
           || echo "Could not register with gnome-session, continuing"
   fi
@@ -30,10 +41,21 @@ if [ -z "${NOTIFY_SOCKET-}" ]; then
 fi
 
 # --------- Script Main -----------
-clear_wm_sockets    # SWAYSOCK and I3SOCK of an earlier session
+if [ -n "$ADDITIONAL_SESSION" ]; then
+    clear_wm_sockets_local # In this process only: the user manager's I3SOCK is the running session's
+else
+    clear_wm_sockets    # SWAYSOCK and I3SOCK of an earlier session
+fi
 
 gdm3_xrdb_fixup     # Remove when https://bugs.launchpad.net/ubuntu/+source/gdm3/+bug/1955850 is fixed
 load_i3_resources   # ~/.Xresources, ~/.config/regolith3/Xresources and the look, as 'regolith-look refresh' does
+
+if [ -n "$ADDITIONAL_SESSION" ]; then
+    # This display's logout (Super+Shift+E) ends this session's i3 only,
+    # and no autostart id of another session reaches this session's i3.
+    set_local_session_logout
+    unset DESKTOP_AUTOSTART_ID
+fi
 
 UPDATE_FLAG_DIR="$HOME/.config/regolith3/flags"
 if [ ! -e "$UPDATE_FLAG_DIR" ]; then
@@ -53,7 +75,17 @@ fi
 
 resolve_default_config_file
 echo "Regolith is launching i3 with $I3_CONFIG_FILE"
-i3 -c "$I3_CONFIG_FILE"
+if [ -n "$ADDITIONAL_SESSION" ]; then
+    # The i3 configuration starts regolith-x11.target with systemctl when
+    # NOTIFY_SOCKET is unset, as it should in a --builtin session. Here that
+    # target is the already running session's, so give i3 a notify socket
+    # that belongs to no unit instead: its readiness notification goes
+    # nowhere and no unit is started. The variable is set for i3 only, so
+    # the post-logout script below still runs when this i3 ends.
+    NOTIFY_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/regolith-x11-additional-notify.$$" i3 -c "$I3_CONFIG_FILE"
+else
+    i3 -c "$I3_CONFIG_FILE"
+fi
 
 # Run the user's post-logout script. In a systemd-managed session,
 # regolith-post-logout.service runs it when the session ends: logging out

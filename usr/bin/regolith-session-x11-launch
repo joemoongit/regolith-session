@@ -16,6 +16,78 @@ case ":${XDG_CONFIG_DIRS-}:" in
     *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-$SESSION_TYPE:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
 esac
 
+# The systemd user manager is one per user, so it can host only one
+# gnome-session: a second gnome-session finds its session target already
+# active, reports that the session manager is already running, and the
+# login drops back to the display manager. It would also replace the
+# running session's DISPLAY, XAUTHORITY and I3SOCK in the manager's
+# environment. A login that finds a session of this user already running
+# therefore does not go through gnome-session at all: it starts an
+# additional standalone session below, which leaves the running session
+# and the manager's environment alone. The check talks to this user's
+# manager only (systemctl --user), so other users' sessions never count,
+# and it sets no limit: any number of additional sessions may follow.
+primary_x11_session_running() {
+    local unit unit_state
+    if command -v systemctl >/dev/null 2>&1; then
+        for unit in regolith-x11.service \
+                    "gnome-session@${SESSION_TYPE}.target" \
+                    "gnome-session-manager@${SESSION_TYPE}.service" \
+                    regolith-x11.target \
+                    gnome-session.target \
+                    graphical-session.target; do
+            unit_state=$(systemctl --user is-active "$unit" 2>/dev/null) || unit_state=""
+            case "$unit_state" in
+                active|activating) return 0 ;;
+            esac
+        done
+
+        # If the unit state cannot be read, look for this user's running
+        # i3 directly: it holds an IPC socket in the (per-user) runtime
+        # directory. A socket left behind by a session that has ended
+        # does not answer, so a fresh login still goes through
+        # gnome-session below.
+        if [ -n "${XDG_RUNTIME_DIR-}" ] && command -v i3-msg >/dev/null 2>&1; then
+            local sock
+            for sock in "$XDG_RUNTIME_DIR"/i3/ipc-socket.*; do
+                [ -S "$sock" ] || continue
+                if timeout 2 i3-msg -s "$sock" -t get_version >/dev/null 2>&1; then
+                    return 0
+                fi
+            done
+        fi
+
+        # Likewise, a different DISPLAY recorded with the manager whose
+        # i3 still answers belongs to a running session, not a stale one.
+        local manager_env manager_display manager_i3sock
+        manager_env=$(systemctl --user show-environment 2>/dev/null) || manager_env=""
+        manager_display=$(printf '%s\n' "$manager_env" | sed -n 's/^DISPLAY=//p' | head -n 1)
+        manager_i3sock=$(printf '%s\n' "$manager_env" | sed -n 's/^I3SOCK=//p' | head -n 1)
+        if [ -n "$manager_display" ] && [ -n "${DISPLAY-}" ] \
+           && [ "$manager_display" != "$DISPLAY" ]; then
+            if [ -n "$manager_i3sock" ] && [ -S "$manager_i3sock" ]; then
+                return 0
+            fi
+            if command -v i3-msg >/dev/null 2>&1; then
+                if [ -n "$manager_i3sock" ] \
+                   && timeout 2 i3-msg -s "$manager_i3sock" -t get_version >/dev/null 2>&1; then
+                    return 0
+                fi
+                if timeout 2 env -u I3SOCK DISPLAY="$manager_display" i3-msg -t get_version >/dev/null 2>&1; then
+                    return 0
+                fi
+            fi
+        fi
+    fi
+    return 1
+}
+
+if primary_x11_session_running; then
+    echo "A Regolith X11 session is already running for this user; starting an additional session on ${DISPLAY-}"
+    export REGOLITH_X11_ADDITIONAL_SESSION=1
+    exec regolith-session-x11 "$@"
+fi
+
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     source /etc/os-release

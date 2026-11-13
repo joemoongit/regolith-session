@@ -70,6 +70,27 @@ clear_wm_sockets() {
     systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
 }
 
+# Drop the IPC socket variables in this process only, without touching the
+# systemd user environment. An additional session (see
+# regolith-session-x11-launch) shares the user manager with the session that
+# is already running: that session's I3SOCK must stay recorded there, while
+# this session's window manager must not inherit it (see clear_wm_sockets).
+clear_wm_sockets_local() {
+    unset I3SOCK SWAYSOCK
+}
+
+# Point this display's Regolith logout binding at this session's own i3.
+# The i3 configuration takes wm.program.logout from the X resources of its
+# own display, defaulting to gnome-session-quit. On an additional session
+# that command would talk to the already running session's gnome-session
+# over the shared session bus and log that session out instead. i3-msg
+# finds this session's i3 through this display (and through the I3SOCK that
+# i3 sets for its children), so the logout ends only this session.
+set_local_session_logout() {
+    printf '%s\n' 'wm.program.logout: i3-msg exit' | xrdb -nocpp -merge - \
+        || echo "Could not set the per-session logout command" >&2
+}
+
 # Determine where the default i3 and sway config files are
 # Sets I3_CONFIG_FILE and SWAY_CONFIG_FILE
 resolve_default_config_file() {
