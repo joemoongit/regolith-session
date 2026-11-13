@@ -1,0 +1,200 @@
+#!/bin/sh
+# A second or later Regolith X11 login for a user cannot start a second
+# systemd-managed gnome-session in the one user manager. It must still open
+# a usable desktop: its own i3 on its own display, without touching the
+# first session's DISPLAY, XAUTHORITY and I3SOCK in the user manager, and
+# logging out of it (Super+Shift+E) must close just that session. A login
+# with no session running must still go through gnome-session as before,
+# and still drop stale I3SOCK/SWAYSOCK. The window manager and gnome-session
+# are stubbed out; systemctl is stubbed to report an active or idle user
+# manager. Runs under Xvfb, with one display per login.
+set -eu
+
+tmp=${AUTOPKGTEST_TMP:-$(mktemp -d)}
+export HOME="$tmp/home" XDG_RUNTIME_DIR="$tmp/xdg"
+mkdir -p "$HOME/.config/regolith3/flags" "$XDG_RUNTIME_DIR" "$tmp/bin" "$tmp/stub"
+chmod 700 "$XDG_RUNTIME_DIR"
+fail=0
+
+# The window manager records its environment per run and stops.
+cat > "$tmp/bin/i3" <<STUB
+#!/bin/sh
+echo "DISPLAY=\$DISPLAY I3SOCK=\${I3SOCK-(unset)} SWAYSOCK=\${SWAYSOCK-(unset)}" >> "$tmp/i3.log"
+env > "$tmp/i3.env.\${TEST_RUN-unknown}"
+exit 0
+STUB
+chmod +x "$tmp/bin/i3"
+
+# Stands in for gnome-session: records that the launcher handed over to it.
+cat > "$tmp/stub/gnome-session" <<STUB
+#!/bin/sh
+echo "called: \$*" >> "$tmp/gnome.log"
+exit 0
+STUB
+chmod +x "$tmp/stub/gnome-session"
+
+# systemctl stub: is-active reports the user manager state from $MODE
+# (active or idle); every call is logged so the test sees writes.
+cat > "$tmp/bin/systemctl" <<STUB
+#!/bin/sh
+echo "\$*" >> "$tmp/systemctl.log"
+if [ "\$1" = "--user" ] && [ "\$2" = "is-active" ]; then
+    if [ "\${MODE-idle}" = "active" ]; then
+        for u in "\$@"; do
+            case "\$u" in
+                regolith-x11.service|regolith-x11.target|gnome-session.target|gnome-session@regolith-x11.target) exit 0 ;;
+            esac
+        done
+    fi
+    exit 1
+fi
+exit 0
+STUB
+chmod +x "$tmp/bin/systemctl"
+
+start_xvfb() { # start_xvfb <name>: sets DISPLAY_<name>
+    Xvfb -displayfd 3 -screen 0 800x600x24 -nolisten tcp -noreset \
+        3>"$tmp/display.$1" >"$tmp/xvfb.$1.log" 2>&1 &
+    # shellcheck disable=SC2064
+    trap 'kill $! 2>/dev/null || true' EXIT
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        [ -s "$tmp/display.$1" ] && break; sleep 0.5
+    done
+    eval "DISPLAY_$1=':$(cat "$tmp/display.$1")'"
+    # A display manager leaves resources; xrescat fails on an empty database.
+    DISPLAY=$(eval "echo \$DISPLAY_$1") sh -c 'echo testkey: testval | xrdb -merge'
+}
+
+start_xvfb first
+start_xvfb second
+start_xvfb third
+# Keep the servers for the whole test; re-arm the trap for all of them.
+trap 'pkill -P $$ Xvfb 2>/dev/null || true' EXIT
+
+run_launch() { # run_launch <run> <display> <mode>
+    TEST_RUN="$1" DISPLAY="$2" MODE="$3" XDG_SESSION_TYPE=x11 \
+    XDG_CURRENT_DESKTOP=Regolith:GNOME-Flashback:GNOME \
+    PATH="$tmp/stub:$tmp/bin:$PATH" \
+    dbus-run-session -- timeout 60 /usr/bin/regolith-session-x11-launch \
+    >"$tmp/$1.log" 2>&1 || true
+    hash -r 2>/dev/null || true
+}
+
+logout_of() { # logout_of <display>: wm.program.logout on that display
+    DISPLAY="$1" xrdb -query 2>/dev/null \
+        | sed -n 's/^wm.program.logout:[[:space:]]*//p'
+}
+
+# 1. Fresh login: no session running, goes through gnome-session.
+rm -f "$tmp/gnome.log" "$tmp/i3.log" "$tmp/systemctl.log"
+run_launch fresh "$DISPLAY_first" idle
+if grep -q "^called:" "$tmp/gnome.log" 2>/dev/null; then
+    echo "ok: fresh login starts through gnome-session"
+else
+    echo "FAIL: fresh login did not start gnome-session"; fail=1
+fi
+if [ -f "$tmp/i3.log" ]; then
+    echo "FAIL: fresh login ran i3 directly"; fail=1
+else
+    echo "ok: fresh login does not run i3 itself"
+fi
+
+# 2. Extra login: a session is already running, runs its own i3 directly.
+rm -f "$tmp/gnome.log" "$tmp/i3.log" "$tmp/systemctl.log"
+TEST_RUN=second DISPLAY="$DISPLAY_second" MODE=active \
+I3SOCK="$XDG_RUNTIME_DIR/stale.sock" SWAYSOCK="$XDG_RUNTIME_DIR/stale.sock" \
+XDG_SESSION_TYPE=x11 XDG_CURRENT_DESKTOP=Regolith:GNOME-Flashback:GNOME \
+PATH="$tmp/stub:$tmp/bin:$PATH" \
+dbus-run-session -- timeout 60 /usr/bin/regolith-session-x11-launch \
+>"$tmp/second.log" 2>&1 || true
+hash -r 2>/dev/null || true
+if [ -f "$tmp/gnome.log" ]; then
+    echo "FAIL: extra login started a second gnome-session"; fail=1
+else
+    echo "ok: extra login does not start gnome-session"
+fi
+if grep -q "DISPLAY=$DISPLAY_second" "$tmp/i3.log" 2>/dev/null; then
+    echo "ok: extra login runs its own i3 on $DISPLAY_second"
+else
+    echo "FAIL: extra login did not run i3 on $DISPLAY_second"
+    cat "$tmp/second.log" 2>&1 | head -n 20 || true; fail=1
+fi
+if [ -f "$tmp/i3.env.second" ]; then
+    for var in I3SOCK SWAYSOCK; do
+        if grep -q "^$var=" "$tmp/i3.env.second"; then
+            echo "FAIL: extra i3 inherited stale $var ($(grep "^$var=" "$tmp/i3.env.second"))"; fail=1
+        else
+            echo "ok: extra i3 starts without $var"
+        fi
+    done
+else
+    echo "FAIL: extra i3 stub did not run"; fail=1
+fi
+if grep -qE "(^| )(set-environment|import-environment|unset-environment)( |$)" "$tmp/systemctl.log" 2>/dev/null; then
+    echo "FAIL: extra login touched the user manager environment:"
+    cat "$tmp/systemctl.log"; fail=1
+else
+    echo "ok: extra login leaves the user manager environment alone"
+fi
+if [ "$(logout_of "$DISPLAY_second")" = "i3-msg exit" ]; then
+    echo "ok: extra logout exits just its own i3"
+else
+    echo "FAIL: extra logout is '$(logout_of "$DISPLAY_second")', expected 'i3-msg exit'"; fail=1
+fi
+
+# 3. No fixed limit: a third login is an extra session too.
+rm -f "$tmp/gnome.log" "$tmp/i3.log"
+run_launch third "$DISPLAY_third" active
+if [ -f "$tmp/gnome.log" ]; then
+    echo "FAIL: third login started gnome-session"; fail=1
+else
+    echo "ok: third login does not start gnome-session"
+fi
+if grep -q "DISPLAY=$DISPLAY_third" "$tmp/i3.log" 2>/dev/null; then
+    echo "ok: third login runs its own i3 on $DISPLAY_third"
+else
+    echo "FAIL: third login did not run i3 on $DISPLAY_third"; fail=1
+fi
+if [ "$(logout_of "$DISPLAY_third")" = "i3-msg exit" ]; then
+    echo "ok: third logout exits just its own i3"
+else
+    echo "FAIL: third logout is '$(logout_of "$DISPLAY_third")'"; fail=1
+fi
+
+# 4. A fresh session script still drops stale sockets from the user manager
+#    and leaves the logout binding for gnome-session-quit.
+rm -f "$tmp/systemctl.log" "$tmp/i3.env.fresh-script"
+DISPLAY="$DISPLAY_first" xrdb -remove 2>/dev/null || true
+DISPLAY="$DISPLAY_first" sh -c 'echo testkey: testval | xrdb -merge'
+TEST_RUN=fresh-script DISPLAY="$DISPLAY_first" MODE=idle \
+I3SOCK="$XDG_RUNTIME_DIR/stale.sock" SWAYSOCK="$XDG_RUNTIME_DIR/stale.sock" \
+PATH="$tmp/bin:$PATH" XDG_SESSION_TYPE=x11 \
+XDG_CURRENT_DESKTOP=Regolith:GNOME-Flashback:GNOME \
+dbus-run-session -- env -u NOTIFY_SOCKET -u REGOLITH_X11_EXTRA_SESSION \
+timeout 60 /usr/bin/regolith-session-x11 >"$tmp/fresh-script.log" 2>&1 || true
+hash -r 2>/dev/null || true
+if grep -q "unset-environment.*I3SOCK.*SWAYSOCK" "$tmp/systemctl.log" 2>/dev/null \
+   || grep -q "unset-environment.*SWAYSOCK.*I3SOCK" "$tmp/systemctl.log" 2>/dev/null; then
+    echo "ok: fresh session clears stale sockets from the user manager"
+else
+    echo "FAIL: fresh session did not clear stale sockets"; fail=1
+fi
+if grep -q "^I3SOCK=" "$tmp/i3.env.fresh-script" 2>/dev/null \
+   || grep -q "^SWAYSOCK=" "$tmp/i3.env.fresh-script" 2>/dev/null; then
+    echo "FAIL: fresh i3 inherited a stale socket"; fail=1
+else
+    echo "ok: fresh i3 starts without stale sockets"
+fi
+if [ -z "$(logout_of "$DISPLAY_first")" ]; then
+    echo "ok: fresh session keeps the gnome-session logout"
+else
+    echo "FAIL: fresh session overrode the logout to '$(logout_of "$DISPLAY_first")'"; fail=1
+fi
+# The extras still carry their own logout after the fresh run elsewhere.
+if [ "$(logout_of "$DISPLAY_second")" = "i3-msg exit" ]; then
+    echo "ok: extra logout still exits just its own i3"
+else
+    echo "FAIL: extra logout changed to '$(logout_of "$DISPLAY_second")'"; fail=1
+fi
+
+exit $fail

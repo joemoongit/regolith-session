@@ -1,6 +1,9 @@
 #!/bin/bash
 set -Eeu -o pipefail
 
+# shellcheck disable=SC1091
+source /usr/lib/regolith/regolith-session-common.sh || :
+
 SESSION_TYPE="regolith-x11"
 
 if [ -z "${XDG_CURRENT_DESKTOP-}" ]; then
@@ -23,6 +26,19 @@ if [ -f /etc/os-release ]; then
     if [[ "${VERSION_CODENAME-}" == "jammy" || "${VERSION_CODENAME-}" == "bookworm" ]]; then
         exec gnome-session --builtin --session=$SESSION_TYPE --disable-acceleration-check "$@"
     fi
+fi
+
+# A second or later login for this user cannot start a second
+# systemd-managed gnome-session in the one user manager: it would fail back
+# to the login screen. Run i3 directly instead, on this display, without
+# touching the user manager's environment. Every such extra session is
+# independent, for any number of sessions and users.
+if command -v regolith_x11_has_running_session >/dev/null 2>&1 \
+   && regolith_x11_has_running_session; then
+    export REGOLITH_X11_EXTRA_SESSION=1
+    unset NOTIFY_SOCKET || :
+    unset DESKTOP_AUTOSTART_ID || :
+    exec /usr/bin/regolith-session-x11
 fi
 
 exec gnome-session --session=$SESSION_TYPE --disable-acceleration-check "$@"

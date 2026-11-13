@@ -58,6 +58,37 @@ import_environment_d() {
     done < <("$generator")
 }
 
+# True when this user already has a graphical session running: the systemd
+# user manager owns a session target or service, or a Regolith X11 session
+# process is running. A second systemd-managed gnome-session cannot run in
+# one user manager, so a later X11 login must not start one: it would fail
+# back to the login screen and overwrite the first session's DISPLAY,
+# XAUTHORITY and I3SOCK in the user manager.
+regolith_x11_has_running_session() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl --user is-active --quiet regolith-x11.service 2>/dev/null && return 0
+        systemctl --user is-active --quiet regolith-x11.target 2>/dev/null && return 0
+        systemctl --user is-active --quiet "gnome-session@regolith-x11.target" 2>/dev/null && return 0
+        systemctl --user is-active --quiet gnome-session.target 2>/dev/null && return 0
+        systemctl --user is-active --quiet regolith-wayland.service 2>/dev/null && return 0
+        systemctl --user is-active --quiet regolith-wayland.target 2>/dev/null && return 0
+    fi
+    if command -v pgrep >/dev/null 2>&1; then
+        local uid
+        uid=$(id -u 2>/dev/null) || uid=""
+        if [ -n "$uid" ]; then
+            pgrep -u "$uid" -x i3 >/dev/null 2>&1 && return 0
+            pgrep -u "$uid" -x gnome-session >/dev/null 2>&1 && return 0
+            # Another regolith-session-x11 (a primary or an extra session).
+            # -A drops this process and its ancestors, so the launcher
+            # (regolith-session-x11-launch) never matches itself; the [r]
+            # keeps pgrep from matching its own command line.
+            pgrep -A -u "$uid" -f "[r]egolith-session-x11" >/dev/null 2>&1 && return 0
+        fi
+    fi
+    return 1
+}
+
 # Drop the IPC socket variables of an earlier session. The sway session puts
 # SWAYSOCK and I3SOCK into the systemd user environment, and the user manager
 # outlives a logout while the user has another session (ssh, lingering, a
@@ -65,8 +96,13 @@ import_environment_d() {
 # them. i3 takes I3SOCK as the path for its own IPC socket, so it would listen
 # on the dead sway socket's path, and a stale SWAYSOCK makes tools believe
 # they run under sway. The window managers set the variables they need.
+# An extra X11 session (REGOLITH_X11_EXTRA_SESSION=1) only drops its own
+# copies: the user manager's environment still belongs to the first session.
 clear_wm_sockets() {
     unset I3SOCK SWAYSOCK
+    if [ "${REGOLITH_X11_EXTRA_SESSION-}" = "1" ]; then
+        return 0
+    fi
     systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
 }
 
