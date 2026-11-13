@@ -20,7 +20,9 @@ if [ -z "${NOTIFY_SOCKET-}" ]; then
   # Register with gnome-session so that it does not kill the whole session thinking it is dead.
   # When gnome-session respawns us after i3 crashed, the client is still
   # registered and this fails with AlreadyRegistered; i3 must start anyway.
-  if [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
+  # An extra standalone login has no session manager of its own: the one on
+  # the bus belongs to the first login and must keep tracking only that one.
+  if [ -n "${DESKTOP_AUTOSTART_ID-}" ] && [ -z "${REGOLITH_X11_EXTRA_SESSION-}" ]; then
       dbus-send --print-reply --session --dest=org.gnome.SessionManager "/org/gnome/SessionManager" org.gnome.SessionManager.RegisterClient "string:Regolith-X11" "string:$DESKTOP_AUTOSTART_ID" \
           || echo "Could not register with gnome-session, continuing"
   fi
@@ -49,6 +51,19 @@ if [ ! -e "$UPDATE_FLAG_DIR" ]; then
         # 'regolith-look refresh' or 'regolith-look set' apply it again
         mkdir -p "$UPDATE_FLAG_DIR"
     fi
+fi
+
+# In an extra standalone login the logout shortcut (Super+Shift+E) must end
+# just this login. Its default runs gnome-session-quit, which talks to the
+# first login's session manager on the shared session bus and would log that
+# out. Point this display's logout at this display's i3 instead; the resource
+# database is per-display, so the first login keeps its own logout. i3-msg
+# finds this login's i3 on its DISPLAY (and through I3SOCK where set), so
+# every extra login gets its own logout even with many running at once.
+if [ -n "${REGOLITH_X11_EXTRA_SESSION-}" ]; then
+    printf '%s\n' 'wm.program.logout: /usr/bin/i3-msg exit' | xrdb -nocpp -merge 2>/dev/null \
+        || printf '%s\n' 'wm.program.logout: /usr/bin/i3-msg exit' | xrdb -merge 2>/dev/null \
+        || echo "Could not set extra session logout, continuing"
 fi
 
 resolve_default_config_file

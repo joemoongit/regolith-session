@@ -16,6 +16,29 @@ case ":${XDG_CONFIG_DIRS-}:" in
     *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-$SESSION_TYPE:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
 esac
 
+# A systemd user manager runs a single graphical session: a second
+# gnome-session for the same user cannot start while the first one's
+# targets are active, and starting one would overwrite the first session's
+# DISPLAY, XAUTHORITY and I3SOCK in the user environment. The session bus
+# likewise holds a single org.gnome.SessionManager, so a second
+# gnome-session --builtin cannot own it either. When this user already has
+# a graphical session, run this login's desktop directly instead: the same
+# script the systemd unit runs, on this login's own DISPLAY, without
+# talking to the user manager or the first login's session manager. Each
+# user has their own manager and bus, so this works for any number of
+# logins and any number of users; the check below names no display, user
+# or count.
+if systemctl --user is-active --quiet graphical-session.target 2>/dev/null \
+    || systemctl --user is-active --quiet gnome-session.target 2>/dev/null \
+    || systemctl --user is-active --quiet "gnome-session@${SESSION_TYPE}.target" 2>/dev/null \
+    || systemctl --user is-active --quiet regolith-x11.service 2>/dev/null \
+    || dbus-send --session --dest=org.freedesktop.DBus --print-reply /org/freedesktop/DBus org.freedesktop.DBus.NameHasOwner string:org.gnome.SessionManager 2>/dev/null | grep -q 'boolean true'; then
+    echo "Regolith already runs for this user; starting an extra standalone X11 session on ${DISPLAY-unknown display}"
+    export REGOLITH_X11_EXTRA_SESSION=1
+    exec /usr/bin/regolith-session-x11
+fi
+unset REGOLITH_X11_EXTRA_SESSION 2>/dev/null || true
+
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     source /etc/os-release

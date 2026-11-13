@@ -65,8 +65,14 @@ import_environment_d() {
 # them. i3 takes I3SOCK as the path for its own IPC socket, so it would listen
 # on the dead sway socket's path, and a stale SWAYSOCK makes tools believe
 # they run under sway. The window managers set the variables they need.
+# An extra standalone X11 login shares the user manager with the first login,
+# whose live I3SOCK the manager still records: drop the stale values from this
+# login's environment only and leave the manager alone.
 clear_wm_sockets() {
     unset I3SOCK SWAYSOCK
+    if [ -n "${REGOLITH_X11_EXTRA_SESSION-}" ]; then
+        return 0
+    fi
     systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
 }
 
