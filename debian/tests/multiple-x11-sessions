@@ -1,0 +1,253 @@
+#!/bin/sh
+# Additional LightDM logins of a user who already has a Regolith X11
+# session must open further independent Regolith sessions: each gets its
+# own i3 on its own display, the systemd user manager environment of the
+# first session is left alone, and logging out of an additional session
+# (Super+Shift+E, wm.program.logout) closes only that session. A login
+# with no session running yet goes through gnome-session as before and
+# clears stale I3SOCK/SWAYSOCK from the user manager environment.
+set -u
+
+tmp=${AUTOPKGTEST_TMP:-$(mktemp -d)}
+export HOME="$tmp/home" XDG_RUNTIME_DIR="$tmp/xdg" XDG_SESSION_TYPE=x11
+export XDG_CURRENT_DESKTOP=Regolith:GNOME-Flashback:GNOME
+export FAKE_TMP="$tmp" FAKE_SYSTEMD_STATE="$tmp/systemd-state"
+mkdir -p "$HOME/.config/regolith3/flags" "$XDG_RUNTIME_DIR" "$tmp/bin" \
+         "$FAKE_SYSTEMD_STATE"
+chmod 700 "$XDG_RUNTIME_DIR"
+fail=0
+note_fail() { echo "FAIL: $1"; fail=1; }
+note_ok() { echo "ok: $1"; }
+
+# --- Fake systemd user manager -------------------------------------------
+cat > "$tmp/bin/systemctl" <<'STUB'
+#!/bin/sh
+state=${FAKE_SYSTEMD_STATE:?}
+mkdir -p "$state"
+echo "systemctl $*" >> "$state/calls.log"
+[ "${1:-}" = "--user" ] && shift
+[ "${1:-}" = "--quiet" ] && shift
+cmd=${1:-}
+[ $# -gt 0 ] && shift
+case "$cmd" in
+    is-active)
+        if [ -f "$state/active" ]; then echo active; exit 0;
+        else echo inactive; exit 3; fi ;;
+    show-environment)
+        cat "$state/env" 2>/dev/null || true ;;
+    unset-environment)
+        for v in "$@"; do
+            if [ -f "$state/env" ]; then
+                grep -v "^$v=" "$state/env" > "$state/env.tmp" || true
+                mv "$state/env.tmp" "$state/env"
+            fi
+        done ;;
+    set-environment)
+        for kv in "$@"; do
+            k=${kv%%=*}
+            if [ -f "$state/env" ]; then
+                grep -v "^$k=" "$state/env" > "$state/env.tmp" || true
+                mv "$state/env.tmp" "$state/env"
+            fi
+            echo "$kv" >> "$state/env"
+        done ;;
+esac
+exit 0
+STUB
+
+# --- Fake gnome-session: records that the primary path was taken --------
+cat > "$tmp/bin/gnome-session" <<'STUB'
+#!/bin/sh
+echo "gnome-session $*" >> "$FAKE_TMP/gnome.calls"
+exit 0
+STUB
+
+# --- Stub window manager: records its environment, then stays running ---
+cat > "$tmp/bin/i3" <<'STUB'
+#!/bin/sh
+env > "$FAKE_TMP/i3${DISPLAY:-unknown}.env"
+echo $$ > "$FAKE_TMP/i3${DISPLAY:-unknown}.pid"
+while :; do sleep 1; done
+STUB
+
+# --- Stub i3-msg: 'exit' ends the stub i3 of this display -----------------
+cat > "$tmp/bin/i3-msg" <<'STUB'
+#!/bin/sh
+if [ "${1:-}" = "exit" ]; then
+    pid=$(cat "$FAKE_TMP/i3${DISPLAY:-unknown}.pid" 2>/dev/null) || exit 1
+    kill "$pid" 2>/dev/null || true
+fi
+exit 0
+STUB
+chmod +x "$tmp/bin/systemctl" "$tmp/bin/gnome-session" "$tmp/bin/i3" "$tmp/bin/i3-msg"
+export PATH="$tmp/bin:$PATH"
+
+# --- Two displays for the additional sessions ----------------------------
+displays=""
+for n in 1 2; do
+    Xvfb -displayfd 3 -screen 0 1280x800x24 -nolisten tcp -noreset \
+        3>"$tmp/display$n" >"$tmp/xvfb$n.log" 2>&1 &
+    eval "xvfb$n=$!"
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$tmp/display$n" ] && break; sleep 0.5; done
+    displays="$displays $(cat "$tmp/display$n")"
+done
+# shellcheck disable=SC2086
+set -- $displays
+d1=$1 d2=$2
+first_pid="" extra_pid=""
+cleanup() {
+    [ -n "$extra_pid" ] && kill "$extra_pid" 2>/dev/null || true
+    [ -n "$first_pid" ] && kill "$first_pid" 2>/dev/null || true
+    kill $xvfb1 $xvfb2 2>/dev/null || true
+}
+trap cleanup EXIT
+
+wait_for_file() { # wait_for_file <path>
+    n=0
+    while [ ! -f "$1" ] && [ $n -lt 60 ]; do n=$((n + 1)); sleep 0.5; done
+    [ -f "$1" ]
+}
+wait_for_exit() { # wait_for_exit <pid>
+    n=0
+    while kill -0 "$1" 2>/dev/null && [ $n -lt 60 ]; do n=$((n + 1)); sleep 0.5; done
+    ! kill -0 "$1" 2>/dev/null
+}
+
+# --- 1. Fresh login: gnome-session path, stale sockets cleared -----------
+printf 'I3SOCK=%s/stale.sock\nSWAYSOCK=%s/stale.sock\n' "$tmp" "$tmp" \
+    > "$FAKE_SYSTEMD_STATE/env"
+rm -f "$tmp/gnome.calls"
+if DISPLAY=:100 XAUTHORITY="$tmp/first-authority" \
+       timeout 30 regolith-session-x11-launch >"$tmp/fresh.log" 2>&1 \
+   && grep -q 'regolith-x11' "$tmp/gnome.calls" 2>/dev/null; then
+    note_ok "fresh login starts through gnome-session"
+else
+    cat "$tmp/fresh.log" 2>/dev/null || true
+    note_fail "fresh login did not start through gnome-session"
+fi
+if grep -qE '^(I3SOCK|SWAYSOCK)=' "$FAKE_SYSTEMD_STATE/env"; then
+    note_fail "fresh login left stale I3SOCK/SWAYSOCK in the user manager environment"
+else
+    note_ok "fresh login cleared stale I3SOCK/SWAYSOCK"
+fi
+
+# --- Simulate the first session running ----------------------------------
+touch "$FAKE_SYSTEMD_STATE/active"
+cat > "$FAKE_SYSTEMD_STATE/env" <<EOF
+DISPLAY=:100
+XAUTHORITY=$tmp/first-authority
+I3SOCK=$tmp/first-i3.sock
+EOF
+DISPLAY=:100 XAUTHORITY="$tmp/first-authority" i3 &
+first_pid=$!
+if wait_for_file "$tmp/i3:100.pid"; then
+    note_ok "first session's i3 is running"
+else
+    note_fail "first session's stub i3 did not start"
+fi
+cp "$FAKE_SYSTEMD_STATE/env" "$tmp/manager-env.before"
+
+# --- 2./3. Additional logins ---------------------------------------------
+extra_login() { # extra_login <display-number> <tag>
+    edisplay=$1 etag=$2
+    extra_env="$tmp/i3:$edisplay.env"
+    rm -f "$extra_env" "$tmp/i3:$edisplay.pid"
+    DISPLAY=":$edisplay" XAUTHORITY="$tmp/$etag-authority" \
+        timeout 90 regolith-session-x11-launch >"$tmp/$etag.log" 2>&1 &
+    extra_pid=$!
+    if ! wait_for_file "$extra_env"; then
+        cat "$tmp/$etag.log" 2>/dev/null || true
+        note_fail "$etag: additional login did not start its own i3"
+        return 1
+    fi
+    note_ok "$etag: additional login started its own i3"
+    if grep -q "^DISPLAY=:$edisplay\$" "$extra_env"; then
+        note_ok "$etag: i3 runs on the new display"
+    else
+        note_fail "$etag: i3 is not on display :$edisplay"
+    fi
+    for var in I3SOCK SWAYSOCK; do
+        if grep -q "^$var=" "$extra_env"; then
+            note_fail "$etag: i3 inherited $var"
+        else
+            note_ok "$etag: i3 started without stale $var"
+        fi
+    done
+    if grep -q '^DBUS_SESSION_BUS_ADDRESS=' "$extra_env"; then
+        note_ok "$etag: session has a session bus"
+    else
+        note_fail "$etag: session has no session bus"
+    fi
+    if [ "$(grep -c . "$tmp/gnome.calls")" -eq 1 ]; then
+        note_ok "$etag: gnome-session was not started again"
+    else
+        note_fail "$etag: gnome-session was started again"
+    fi
+    if cmp -s "$tmp/manager-env.before" "$FAKE_SYSTEMD_STATE/env"; then
+        note_ok "$etag: user manager environment still points at the first session"
+    else
+        diff "$tmp/manager-env.before" "$FAKE_SYSTEMD_STATE/env" || true
+        note_fail "$etag: user manager environment changed"
+    fi
+    if kill -0 "$first_pid" 2>/dev/null; then
+        note_ok "$etag: first session still running"
+    else
+        note_fail "$etag: first session stopped"
+    fi
+    # Logout as Super+Shift+E does: run wm.program.logout of this display.
+    logout_cmd=$(DISPLAY=":$edisplay" xrescat wm.program.logout \
+                 '/usr/bin/gnome-session-quit --logout' 2>/dev/null) || logout_cmd=""
+    case "$logout_cmd" in
+        *gnome-session-quit*)
+            note_fail "$etag: logout still targets gnome-session ($logout_cmd)"
+            return 1 ;;
+        *i3-msg*)
+            note_ok "$etag: logout is session-local ($logout_cmd)" ;;
+        *)
+            note_fail "$etag: unexpected logout command '$logout_cmd'"
+            return 1 ;;
+    esac
+    DISPLAY=":$edisplay" sh -c "$logout_cmd" >/dev/null 2>&1 || true
+    if wait_for_exit "$extra_pid"; then
+        note_ok "$etag: logout closed the additional session"
+    else
+        note_fail "$etag: logout did not close the additional session"
+    fi
+    extra_pid=""
+    if kill -0 "$first_pid" 2>/dev/null; then
+        note_ok "$etag: first session survived the additional logout"
+    else
+        note_fail "$etag: first session died with the additional logout"
+    fi
+    if cmp -s "$tmp/manager-env.before" "$FAKE_SYSTEMD_STATE/env"; then
+        note_ok "$etag: user manager environment unchanged after logout"
+    else
+        note_fail "$etag: user manager environment changed after logout"
+    fi
+    return 0
+}
+
+extra_login "$d1" extra1 || true
+extra_login "$d2" extra2 || true
+
+# --- 4. Once no session runs any more, a login is a fresh login again -----
+kill "$first_pid" 2>/dev/null || true
+first_pid=""
+rm -f "$FAKE_SYSTEMD_STATE/active"
+printf 'I3SOCK=%s/stale.sock\nSWAYSOCK=%s/stale.sock\n' "$tmp" "$tmp" \
+    > "$FAKE_SYSTEMD_STATE/env"
+if DISPLAY=:100 XAUTHORITY="$tmp/first-authority" \
+       timeout 30 regolith-session-x11-launch >"$tmp/fresh-again.log" 2>&1 \
+   && [ "$(grep -c . "$tmp/gnome.calls")" -eq 2 ]; then
+    note_ok "login after all sessions ended starts through gnome-session again"
+else
+    cat "$tmp/fresh-again.log" 2>/dev/null || true
+    note_fail "login after all sessions ended did not use gnome-session"
+fi
+if grep -qE '^(I3SOCK|SWAYSOCK)=' "$FAKE_SYSTEMD_STATE/env"; then
+    note_fail "login after all sessions ended left stale I3SOCK/SWAYSOCK"
+else
+    note_ok "login after all sessions ended cleared stale I3SOCK/SWAYSOCK"
+fi
+
+exit $fail

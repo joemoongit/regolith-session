@@ -5,6 +5,8 @@ set -Eeu -o pipefail
 
 source /usr/lib/regolith/regolith-session-common.sh
 
+regolith_register_session_marker
+
 gdm3_xrdb_fixup() {
     if xrescat testkey defaultval > /dev/null 2>&1; then
         echo "xrdb appears to be property initialized, skipping xrdb init"
@@ -16,7 +18,12 @@ gdm3_xrdb_fixup() {
 }
 # Check if NOTIFY_SOCKET is available. This is used as a
 # test to see if the session uses systemd
-if [ -z "${NOTIFY_SOCKET-}" ]; then
+if is_additional_session; then
+  # Standalone session: there is no gnome-session to register with (the
+  # launcher already dropped DESKTOP_AUTOSTART_ID), but the session still
+  # gets the environment.d variables, as in a --builtin session.
+  import_environment_d
+elif [ -z "${NOTIFY_SOCKET-}" ]; then
   # Register with gnome-session so that it does not kill the whole session thinking it is dead.
   # When gnome-session respawns us after i3 crashed, the client is still
   # registered and this fails with AlreadyRegistered; i3 must start anyway.
@@ -51,9 +58,32 @@ if [ ! -e "$UPDATE_FLAG_DIR" ]; then
     fi
 fi
 
+use_local_logout_for_additional_session # Super+Shift+E ends this session only
+
+# An additional session has no session manager on its private bus for
+# gnome-session-quit to talk to; provide a minimal one that only ends
+# this session. If it cannot start, the logout binding above still works.
+ADDITIONAL_SESSION_MANAGER_PID=""
+if is_additional_session && [ -x /usr/lib/regolith/regolith-additional-session-manager ]; then
+    /usr/lib/regolith/regolith-additional-session-manager &
+    ADDITIONAL_SESSION_MANAGER_PID=$!
+fi
+
 resolve_default_config_file
 echo "Regolith is launching i3 with $I3_CONFIG_FILE"
-i3 -c "$I3_CONFIG_FILE"
+if is_additional_session; then
+    # Keep i3's own startup from touching the first session: with a
+    # NOTIFY_SOCKET set, its config takes the systemd-notify path instead
+    # of starting regolith-x11.target in the shared user manager. The
+    # value names no socket, so the notify attempt is a harmless no-op.
+    NOTIFY_SOCKET=regolith-additional-session i3 -c "$I3_CONFIG_FILE"
+else
+    i3 -c "$I3_CONFIG_FILE"
+fi
+
+if [ -n "$ADDITIONAL_SESSION_MANAGER_PID" ]; then
+    kill "$ADDITIONAL_SESSION_MANAGER_PID" 2>/dev/null || :
+fi
 
 # Run the user's post-logout script. In a systemd-managed session,
 # regolith-post-logout.service runs it when the session ends: logging out

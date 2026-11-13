@@ -1,0 +1,99 @@
+#!/usr/bin/python3
+# Minimal org.gnome.SessionManager for an additional Regolith session.
+#
+# An additional session runs on its own private session bus, where no
+# session manager owns this name. Without it, gnome-session-quit -- which
+# Regolith's logout shortcut (Super+Shift+E) runs, and which asks the
+# session manager to log out -- could not end the additional session at
+# all. This manager only ends its own session: it asks this display's i3
+# to exit, which ends the session process tree. It never talks to the
+# systemd user manager or to another session's bus.
+import subprocess
+import sys
+import warnings
+
+try:
+    import gi
+
+    gi.require_version("Gio", "2.0")
+    from gi.repository import Gio, GLib
+except Exception:
+    # The Xresource logout binding (wm.program.logout=i3-msg exit) still
+    # ends the session, so a manager that cannot start is not fatal.
+    sys.exit(0)
+
+warnings.filterwarnings("ignore")
+
+INTERFACE = """
+<node>
+  <interface name="org.gnome.SessionManager">
+    <method name="RegisterClient">
+      <arg type="s" name="app_id" direction="in"/>
+      <arg type="s" name="client_startup_id" direction="in"/>
+      <arg type="o" name="client_id" direction="out"/>
+    </method>
+    <method name="UnregisterClient">
+      <arg type="o" name="client_id" direction="in"/>
+    </method>
+    <method name="Logout">
+      <arg type="u" name="mode" direction="in"/>
+    </method>
+    <method name="IsSessionRunning">
+      <arg type="b" name="running" direction="out"/>
+    </method>
+    <method name="CanShutdown">
+      <arg type="b" name="can_shutdown" direction="out"/>
+    </method>
+  </interface>
+</node>
+"""
+
+loop = GLib.MainLoop()
+
+
+def end_session():
+    # i3-msg finds this display's i3 through the X server (DISPLAY is
+    # inherited from the session), so only this session's i3 exits.
+    try:
+        subprocess.run(["i3-msg", "exit"], check=False)
+    finally:
+        loop.quit()
+    return False
+
+
+def on_method(connection, sender, path, interface, method, params, invocation):
+    if method == "Logout":
+        invocation.return_value(None)
+        GLib.timeout_add(50, end_session)
+    elif method == "IsSessionRunning":
+        invocation.return_value(GLib.Variant("(b)", (True,)))
+    elif method == "CanShutdown":
+        invocation.return_value(GLib.Variant("(b)", (False,)))
+    elif method == "RegisterClient":
+        invocation.return_value(
+            GLib.Variant("(o)", ("/org/gnome/SessionManager/Client1",))
+        )
+    else:
+        invocation.return_value(None)
+
+
+def on_bus_acquired(connection, name):
+    info = Gio.DBusNodeInfo.new_for_xml(INTERFACE)
+    connection.register_object(
+        "/org/gnome/SessionManager", info.interfaces[0], on_method, None, None
+    )
+
+
+def on_name_lost(connection, name):
+    loop.quit()
+
+
+Gio.bus_own_name(
+    Gio.BusType.SESSION,
+    "org.gnome.SessionManager",
+    Gio.BusNameOwnerFlags.NONE,
+    on_bus_acquired,
+    None,
+    on_name_lost,
+)
+loop.run()

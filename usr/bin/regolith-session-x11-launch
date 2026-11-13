@@ -16,6 +16,131 @@ case ":${XDG_CONFIG_DIRS-}:" in
     *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-$SESSION_TYPE:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
 esac
 
+# --- Additional-session detection ----------------------------------------
+# gnome-session and the systemd user manager are per-user singletons: the
+# first session owns the session bus, org.gnome.SessionManager and the
+# gnome-session@regolith-x11.target / regolith-x11.service units, and the
+# user manager environment holds that session's DISPLAY, XAUTHORITY and
+# I3SOCK. A second gnome-session for the same user therefore cannot start
+# and the login falls back to the greeter. Further logins instead run a
+# standalone session (see below); how many there are is not limited.
+_session_marker_dir() {
+    printf '%s/regolith-sessions' "${XDG_RUNTIME_DIR:-/tmp/regolith-$(id -u)}"
+}
+
+_register_session_marker() {
+    local dir
+    dir=$(_session_marker_dir) || return 0
+    mkdir -p "$dir" 2>/dev/null || return 0
+    # $$ is the pid the exec below keeps, so the marker names the session
+    # leader process and is live exactly while the session is.
+    printf '%s\n%s\n' "$$" "${DISPLAY-}" > "$dir/$$" 2>/dev/null || :
+}
+
+_marker_pid_is_live_session() { # <pid>
+    local pid=$1 cmd=""
+    [ -n "$pid" ] || return 1
+    [ "$pid" != "$$" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [ -r "/proc/$pid/cmdline" ]; then
+        cmd=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null) || cmd=""
+        case "$cmd" in
+            *gnome-session*|*regolith-session*|*dbus-run-session*|*i3*) ;;
+            *) [ -z "$cmd" ] || return 1 ;;
+        esac
+    fi
+    return 0
+}
+
+_session_already_running() {
+    local unit state dir file pid uid sid sessions props
+
+    # The first session's units in this user's systemd manager.
+    if command -v systemctl >/dev/null 2>&1; then
+        for unit in regolith-x11.service gnome-session@regolith-x11.target; do
+            state=$(systemctl --user is-active "$unit" 2>/dev/null) || true
+            if [ "$state" = "active" ]; then
+                return 0
+            fi
+        done
+    fi
+
+    # A live session registered itself here (first and additional alike).
+    dir=$(_session_marker_dir)
+    if [ -d "$dir" ]; then
+        for file in "$dir"/*; do
+            [ -f "$file" ] || continue
+            pid=$(head -n 1 "$file" 2>/dev/null) || continue
+            if _marker_pid_is_live_session "$pid"; then
+                return 0
+            fi
+            if ! kill -0 "$pid" 2>/dev/null; then
+                rm -f "$file" 2>/dev/null || :
+            fi
+        done
+    fi
+
+    # A window manager or session manager of this user is already up.
+    if command -v pgrep >/dev/null 2>&1; then
+        uid=$(id -u)
+        if pgrep -u "$uid" -x i3 >/dev/null 2>&1; then
+            return 0
+        fi
+        if pgrep -u "$uid" -x gnome-session >/dev/null 2>&1; then
+            return 0
+        fi
+    fi
+
+    # Another active X11 logind session of this user (ours is the login
+    # LightDM just created for this very start).
+    if [ -n "${XDG_SESSION_ID-}" ] && command -v loginctl >/dev/null 2>&1; then
+        uid=$(id -u)
+        sessions=$(loginctl --no-legend list-sessions 2>/dev/null | awk '{print $1}') || sessions=""
+        for sid in $sessions; do
+            [ "$sid" != "$XDG_SESSION_ID" ] || continue
+            props=$(loginctl show-session "$sid" -p Type -p Class -p Active -p User 2>/dev/null) || continue
+            if printf '%s\n' "$props" | grep -qx 'Type=x11' \
+               && printf '%s\n' "$props" | grep -qx 'Class=user' \
+               && printf '%s\n' "$props" | grep -qx 'Active=yes' \
+               && printf '%s\n' "$props" | grep -qx "User=$uid"; then
+                return 0
+            fi
+        done
+    fi
+
+    return 1
+}
+
+if _session_already_running; then
+    # Additional session: run the same Regolith X11 session script the
+    # systemd service runs for the first session, but standalone. A
+    # private session bus (dbus-run-session) keeps this session's
+    # services, its gnome-session-quit target and anything that would
+    # update the systemd user environment away from the first session,
+    # whose DISPLAY, XAUTHORITY and I3SOCK stay as they are. Nothing here
+    # starts, stops or reconfigures the first session's units, and each
+    # login gets its own bus, display and i3, for any user and any
+    # number of sessions. Leaving the session (i3 exits, e.g. through
+    # the session-local logout binding) ends only this process tree.
+    export REGOLITH_ADDITIONAL_SESSION=1
+    unset I3SOCK SWAYSOCK NOTIFY_SOCKET DESKTOP_AUTOSTART_ID
+    _register_session_marker
+    if command -v dbus-run-session >/dev/null 2>&1; then
+        exec dbus-run-session -- regolith-session-x11 "$@"
+    fi
+    exec regolith-session-x11 "$@"
+fi
+
+# First session of this user: exactly the login as before, through
+# gnome-session. Clear stale window-manager sockets left in the user
+# manager by an earlier session first, as the session script also does
+# when it starts; the standalone path above must not do this.
+unset I3SOCK SWAYSOCK
+if command -v systemctl >/dev/null 2>&1; then
+    systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
+fi
+_register_session_marker
+
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     source /etc/os-release

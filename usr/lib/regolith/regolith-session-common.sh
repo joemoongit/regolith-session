@@ -58,6 +58,35 @@ import_environment_d() {
     done < <("$generator")
 }
 
+# Whether this process belongs to an additional session: a session opened
+# while another session of the same user is already running. Additional
+# sessions do not use gnome-session or the systemd user manager, which are
+# per-user singletons owned by the first session.
+is_additional_session() {
+    case "${REGOLITH_ADDITIONAL_SESSION-}" in
+        1|true|yes) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+# Directory with one marker file per live Regolith session of this user.
+# The file is named by the session process PID and holds that PID, so a
+# later login can tell live sessions from markers left by ended ones.
+regolith_session_marker_dir() {
+    printf '%s/regolith-sessions' "${XDG_RUNTIME_DIR:-/tmp/regolith-$(id -u)}"
+}
+
+# Record this process as a live session. The PID survives the exec of the
+# session leader (gnome-session or the additional-session launcher), and
+# the caller stays alive for the session, so the marker is live exactly
+# while the session is.
+regolith_register_session_marker() {
+    local dir
+    dir=$(regolith_session_marker_dir) || return 0
+    mkdir -p "$dir" 2>/dev/null || return 0
+    printf '%s\n%s\n' "$$" "${DISPLAY-}" > "$dir/$$" 2>/dev/null || :
+}
+
 # Drop the IPC socket variables of an earlier session. The sway session puts
 # SWAYSOCK and I3SOCK into the systemd user environment, and the user manager
 # outlives a logout while the user has another session (ssh, lingering, a
@@ -65,9 +94,33 @@ import_environment_d() {
 # them. i3 takes I3SOCK as the path for its own IPC socket, so it would listen
 # on the dead sway socket's path, and a stale SWAYSOCK makes tools believe
 # they run under sway. The window managers set the variables they need.
+# An additional session only drops them from its own environment: the ones
+# in the user manager belong to the first session and must stay there.
 clear_wm_sockets() {
     unset I3SOCK SWAYSOCK
+    if is_additional_session; then
+        return 0
+    fi
     systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
+}
+
+# Point this display's logout binding at this session's own i3. The binding
+# (Super+Shift+E) runs wm.program.logout, whose default is
+# gnome-session-quit: on the shared user session bus that would log out the
+# first session, and on an additional session's private bus there is no
+# session manager at all. Xresources are per display, so merging this into
+# the additional session's own display leaves other displays alone. A
+# logout command the user chose themselves is kept.
+use_local_logout_for_additional_session() {
+    local current=""
+    is_additional_session || return 0
+    current=$(xrescat wm.program.logout '/usr/bin/gnome-session-quit --logout' 2>/dev/null) || current=""
+    case "$current" in
+        ""|*gnome-session-quit*)
+            printf '%s\n' 'wm.program.logout: i3-msg exit' \
+                | xrdb -nocpp -merge 2>/dev/null || :
+            ;;
+    esac
 }
 
 # Determine where the default i3 and sway config files are
