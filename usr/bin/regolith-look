@@ -45,6 +45,12 @@ refresh() {
         swaymsg -t send_tick '{"status": "reload_pending"}'
     else
         reload_i3_resources
+        # Rebuilding drops the secondary logout override, which lives only
+        # in this display's resources; put it back so logout still ends just
+        # this session.
+        if [ -n "${REGOLITH_X11_SECONDARY-}" ]; then
+            apply_secondary_logout_override
+        fi
     fi
 
     # Determine if Look loader script is available

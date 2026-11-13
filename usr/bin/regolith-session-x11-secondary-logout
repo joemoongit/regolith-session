@@ -1,0 +1,9 @@
+#!/bin/bash
+# Log out of a secondary Regolith X11 session. Secondary sessions have no
+# gnome-session manager of their own, and the shared session bus still points
+# gnome-session-quit at the first session, so exit this session's i3 instead.
+# I3SOCK and DISPLAY each point at this session, and i3-msg falls back to the
+# socket published on this display's root window, so only this session ends.
+set -eu
+
+exec i3-msg exit

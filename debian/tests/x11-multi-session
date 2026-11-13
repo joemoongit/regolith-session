@@ -1,0 +1,246 @@
+#!/bin/sh
+# Extra Regolith X11 logins must open usable sessions beside the first one.
+# systemd's user manager holds one graphical session per user, so a login
+# while one of mine runs must not go through gnome-session again (it would
+# exit and drop back to the login screen). Instead it starts its own i3 on
+# its own display, leaves DISPLAY/XAUTHORITY/I3SOCK in the user manager
+# pointing at the first session, and logs out only itself.
+#  1. With no session active, the launch script execs gnome-session.
+#  2. With a session active, it starts a secondary session: its own i3 on
+#     its own display, I3SOCK/SWAYSOCK cleared locally but not in the user
+#     manager, no gnome-session registration, and a logout override that
+#     ends only that session.
+#  3. Any number of secondary displays each get their own session.
+#  4. The secondary logout exits only its own i3.
+set -eu
+
+tmp=${AUTOPKGTEST_TMP:-$(mktemp -d)}
+export HOME="$tmp/home" XDG_RUNTIME_DIR="$tmp/xdg"
+mkdir -p "$HOME/.config/regolith3/flags" "$XDG_RUNTIME_DIR" "$tmp/bin" "$tmp/logs"
+chmod 700 "$XDG_RUNTIME_DIR"
+fail=0
+logs="$tmp/logs"
+export MOCK_LOG_DIR="$logs"
+
+# Mocks. systemctl simulates an active or absent graphical session and
+# records every environment or target change; gnome-session, dbus-send, i3
+# and i3-msg record their calls instead of starting a real session.
+cat > "$tmp/bin/systemctl" <<'EOF'
+#!/bin/sh
+echo "$*" >> "$MOCK_LOG_DIR/systemctl.log"
+case " $* " in
+    *" is-active "*)
+        if [ "${MOCK_ACTIVE_SESSION-0}" = "1" ]; then exit 0; else exit 3; fi ;;
+esac
+exit 0
+EOF
+cat > "$tmp/bin/gnome-session" <<'EOF'
+#!/bin/sh
+echo "gnome-session $*" >> "$MOCK_LOG_DIR/calls.log"
+env > "$MOCK_LOG_DIR/gnome-session.env"
+exit 0
+EOF
+cat > "$tmp/bin/dbus-send" <<'EOF'
+#!/bin/sh
+echo "dbus-send $*" >> "$MOCK_LOG_DIR/calls.log"
+exit 0
+EOF
+cat > "$tmp/bin/i3" <<'EOF'
+#!/bin/sh
+echo "i3 $*" >> "$MOCK_LOG_DIR/calls.log"
+env > "$MOCK_I3_ENV_FILE"
+exit 0
+EOF
+cat > "$tmp/bin/i3-msg" <<'EOF'
+#!/bin/sh
+echo "i3-msg $*" >> "$MOCK_LOG_DIR/calls.log"
+printf '%s\n' "$*" > "$MOCK_LOG_DIR/i3-msg.args"
+exit 0
+EOF
+chmod +x "$tmp/bin/systemctl" "$tmp/bin/gnome-session" "$tmp/bin/dbus-send" \
+         "$tmp/bin/i3" "$tmp/bin/i3-msg"
+
+export PATH="$tmp/bin:$PATH"
+
+rm -f "$logs/calls.log" "$logs/systemctl.log"
+
+# 1. Fresh login without a running session goes through gnome-session.
+echo "--- fresh login uses gnome-session"
+MOCK_ACTIVE_SESSION=0
+rm -f "$logs/calls.log" "$logs/gnome-session.env"
+if ! env -u NOTIFY_SOCKET -u REGOLITH_X11_SECONDARY DISPLAY=:0 \
+        XDG_SESSION_TYPE=x11 XDG_CURRENT_DESKTOP=Regolith:GNOME-Flashback:GNOME \
+        timeout 30 regolith-session-x11-launch >"$tmp/fresh.log" 2>&1; then
+    cat "$tmp/fresh.log"
+    echo "FAIL: fresh launch did not complete"
+    fail=1
+fi
+if grep -q "^gnome-session --session=regolith-x11" "$logs/calls.log" 2>/dev/null; then
+    echo "ok: fresh login execs gnome-session"
+else
+    echo "FAIL: fresh login did not exec gnome-session"
+    cat "$logs/calls.log" 2>/dev/null || true
+    fail=1
+fi
+if grep -q "^i3 " "$logs/calls.log" 2>/dev/null; then
+    echo "FAIL: fresh login started i3 directly instead of gnome-session"
+    fail=1
+fi
+
+# Secondary logins need a real X server for the resource database.
+Xvfb -displayfd 3 -screen 0 1280x800x24 -nolisten tcp -noreset \
+    3>"$tmp/display" >"$tmp/xvfb.log" 2>&1 &
+xvfb=$!
+trap 'kill $xvfb 2>/dev/null || true' EXIT
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$tmp/display" ] && break; sleep 0.5; done
+display=$(cat "$tmp/display")
+
+run_secondary() { # run_secondary <tag> <display> <i3sock>
+    tag=$1 disp=$2 sock=$3
+    rm -f "$logs/calls.log" "$logs/systemctl.log"
+    export MOCK_I3_ENV_FILE="$logs/i3-$tag.env"
+    rm -f "$MOCK_I3_ENV_FILE"
+    MOCK_ACTIVE_SESSION=1 \
+    env -u NOTIFY_SOCKET DISPLAY=":$disp" XDG_SESSION_TYPE=x11 \
+        XDG_CURRENT_DESKTOP=Regolith:GNOME-Flashback:GNOME \
+        DESKTOP_AUTOSTART_ID="secondary-$tag" \
+        I3SOCK="$sock" SWAYSOCK="$sock" \
+        XAUTHORITY="$tmp/xauth-$tag" \
+        timeout 60 dbus-run-session -- regolith-session-x11-launch \
+        >"$tmp/secondary-$tag.log" 2>&1 || {
+            echo "FAIL: secondary login $tag did not complete"
+            cat "$tmp/secondary-$tag.log"
+            fail=1
+            return 1
+        }
+}
+
+stale="$XDG_RUNTIME_DIR/sway-ipc.1000.4242.sock"
+
+# 2. Secondary login beside a running session.
+echo "--- secondary login starts its own i3"
+run_secondary first "$display" "$stale" || true
+if grep -q "^gnome-session " "$logs/calls.log" 2>/dev/null; then
+    echo "FAIL: secondary login execed gnome-session"
+    fail=1
+else
+    echo "ok: secondary login did not exec gnome-session"
+fi
+if [ ! -f "$logs/i3-first.env" ]; then
+    echo "FAIL: secondary login did not start i3"
+    fail=1
+else
+    echo "ok: secondary login started i3"
+    if grep -q "^DISPLAY=:$display$" "$logs/i3-first.env"; then
+        echo "ok: secondary i3 runs on its own display :$display"
+    else
+        echo "FAIL: secondary i3 not on :$display"
+        grep "^DISPLAY=" "$logs/i3-first.env" || true
+        fail=1
+    fi
+    for var in I3SOCK SWAYSOCK; do
+        if grep -q "^$var=" "$logs/i3-first.env"; then
+            echo "FAIL: secondary i3 inherited $var=$(grep "^$var=" "$logs/i3-first.env")"
+            fail=1
+        else
+            echo "ok: secondary i3 started without $var"
+        fi
+    done
+    if grep -q "^REGOLITH_X11_SECONDARY=1$" "$logs/i3-first.env"; then
+        echo "ok: secondary i3 marked as secondary"
+    else
+        echo "FAIL: secondary i3 lacks REGOLITH_X11_SECONDARY=1"
+        fail=1
+    fi
+    notify=$(sed -n 's/^NOTIFY_SOCKET=//p' "$logs/i3-first.env" || true)
+    if [ -n "$notify" ]; then
+        echo "ok: secondary i3 has dummy NOTIFY_SOCKET=$notify"
+        case $notify in
+            *secondary*":$display"*|*secondary*"_$display"*|*secondary*)
+                echo "ok: dummy NOTIFY_SOCKET is secondary-specific" ;;
+            *)
+                echo "FAIL: dummy NOTIFY_SOCKET=$notify looks like the systemd socket"
+                fail=1 ;;
+        esac
+    else
+        echo "FAIL: secondary i3 has no NOTIFY_SOCKET, so its config would start the first session's target"
+        fail=1
+    fi
+fi
+if grep -q "dbus-send .*RegisterClient" "$logs/calls.log" 2>/dev/null; then
+    echo "FAIL: secondary login registered with the first session's manager"
+    fail=1
+else
+    echo "ok: secondary login did not register with gnome-session"
+fi
+if grep -E "(set-environment|import-environment|unset-environment).*(DISPLAY|XAUTHORITY|I3SOCK|SWAYSOCK)" \
+        "$logs/systemctl.log" 2>/dev/null; then
+    echo "FAIL: secondary login touched the user manager environment"
+    fail=1
+else
+    echo "ok: secondary login left the user manager environment alone"
+fi
+if grep -q "start .*regolith-x11.target" "$logs/systemctl.log" 2>/dev/null; then
+    echo "FAIL: secondary login started the first session's target"
+    fail=1
+else
+    echo "ok: secondary login did not start regolith-x11.target"
+fi
+if DISPLAY=":$display" xrdb -query 2>/dev/null | grep -q "wm.program.logout.*regolith-session-x11-secondary-logout"; then
+    echo "ok: secondary display logs out through its own logout"
+else
+    echo "FAIL: secondary display lacks the logout override"
+    DISPLAY=":$display" xrdb -query 2>/dev/null | grep "wm.program.logout" || true
+    fail=1
+fi
+
+# 3. More secondary logins each get their own session: no fixed limit.
+echo "--- further secondary logins"
+Xvfb -displayfd 3 -screen 0 1280x800x24 -nolisten tcp -noreset \
+    3>"$tmp/display2" >"$tmp/xvfb2.log" 2>&1 &
+xvfb2=$!
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$tmp/display2" ] && break; sleep 0.5; done
+display2=$(cat "$tmp/display2")
+run_secondary second "$display2" "$stale" || true
+if [ -f "$logs/i3-second.env" ] && grep -q "^DISPLAY=:$display2$" "$logs/i3-second.env"; then
+    echo "ok: second secondary i3 runs on its own display :$display2"
+else
+    echo "FAIL: second secondary i3 not on :$display2"
+    fail=1
+fi
+notify1=$(sed -n 's/^NOTIFY_SOCKET=//p' "$logs/i3-first.env" 2>/dev/null || true)
+notify2=$(sed -n 's/^NOTIFY_SOCKET=//p' "$logs/i3-second.env" 2>/dev/null || true)
+if [ -n "$notify1" ] && [ -n "$notify2" ] && [ "$notify1" != "$notify2" ]; then
+    echo "ok: secondary sessions each have their own NOTIFY_SOCKET"
+else
+    echo "FAIL: secondary sessions share NOTIFY_SOCKET ($notify1 / $notify2)"
+    fail=1
+fi
+kill $xvfb2 2>/dev/null || true
+
+# 4. The secondary logout exits only its own i3.
+echo "--- secondary logout"
+rm -f "$logs/calls.log" "$logs/i3-msg.args"
+export MOCK_I3_ENV_FILE="$logs/i3-logout.env"
+if DISPLAY=":$display" timeout 30 regolith-session-x11-secondary-logout \
+        >"$tmp/logout.log" 2>&1; then
+    if grep -qx "exit" "$logs/i3-msg.args" 2>/dev/null; then
+        echo "ok: secondary logout runs i3-msg exit"
+    else
+        echo "FAIL: secondary logout did not run i3-msg exit"
+        cat "$logs/i3-msg.args" 2>/dev/null || true
+        fail=1
+    fi
+else
+    echo "FAIL: secondary logout did not complete"
+    cat "$tmp/logout.log"
+    fail=1
+fi
+if grep -q "gnome-session-quit" "$logs/calls.log" 2>/dev/null; then
+    echo "FAIL: secondary logout talked to the first session's manager"
+    fail=1
+else
+    echo "ok: secondary logout stayed away from gnome-session"
+fi
+
+exit $fail

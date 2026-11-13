@@ -20,7 +20,9 @@ if [ -z "${NOTIFY_SOCKET-}" ]; then
   # Register with gnome-session so that it does not kill the whole session thinking it is dead.
   # When gnome-session respawns us after i3 crashed, the client is still
   # registered and this fails with AlreadyRegistered; i3 must start anyway.
-  if [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
+  # Secondary sessions never register: the bus still points at the first
+  # session's manager, which must keep tracking only that session.
+  if [ -n "${DESKTOP_AUTOSTART_ID-}" ] && [ -z "${REGOLITH_X11_SECONDARY-}" ]; then
       dbus-send --print-reply --session --dest=org.gnome.SessionManager "/org/gnome/SessionManager" org.gnome.SessionManager.RegisterClient "string:Regolith-X11" "string:$DESKTOP_AUTOSTART_ID" \
           || echo "Could not register with gnome-session, continuing"
   fi
@@ -34,6 +36,10 @@ clear_wm_sockets    # SWAYSOCK and I3SOCK of an earlier session
 
 gdm3_xrdb_fixup     # Remove when https://bugs.launchpad.net/ubuntu/+source/gdm3/+bug/1955850 is fixed
 load_i3_resources   # ~/.Xresources, ~/.config/regolith3/Xresources and the look, as 'regolith-look refresh' does
+
+if [ -n "${REGOLITH_X11_SECONDARY-}" ]; then
+    apply_secondary_logout_override
+fi
 
 UPDATE_FLAG_DIR="$HOME/.config/regolith3/flags"
 if [ ! -e "$UPDATE_FLAG_DIR" ]; then
@@ -53,12 +59,25 @@ fi
 
 resolve_default_config_file
 echo "Regolith is launching i3 with $I3_CONFIG_FILE"
-i3 -c "$I3_CONFIG_FILE"
+if [ -n "${REGOLITH_X11_SECONDARY-}" ]; then
+    # The stock i3 config starts regolith-x11.target when NOTIFY_SOCKET is
+    # empty; that target belongs to the first session. Offer i3 a dummy
+    # socket instead, so it notifies there and leaves the user manager
+    # alone. The name carries this display, so any number of secondary
+    # sessions each get their own value and none of them is a real socket.
+    secondary_display="${DISPLAY-unknown}"
+    secondary_display="${secondary_display//[^A-Za-z0-9]/_}"
+    NOTIFY_SOCKET="/run/user/${UID:-0}/regolith-x11-secondary-${secondary_display}.notify" \
+        i3 -c "$I3_CONFIG_FILE"
+else
+    i3 -c "$I3_CONFIG_FILE"
+fi
 
 # Run the user's post-logout script. In a systemd-managed session,
 # regolith-post-logout.service runs it when the session ends: logging out
 # stops this script together with the window manager, so it would never get
-# here. Without systemd (gnome-session --builtin) it runs here.
+# here. Without systemd (gnome-session --builtin) and in a secondary session,
+# which has no service of its own, it runs here.
 if [ -z "${NOTIFY_SOCKET-}" ] && [ -f "$USER_POST_LOGOUT_SCRIPT_FILE" ] ; then
     echo "Regolith is launching user post-logout file $USER_POST_LOGOUT_SCRIPT_FILE"
 	timeout --verbose 5 bash "$USER_POST_LOGOUT_SCRIPT_FILE"

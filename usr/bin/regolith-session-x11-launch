@@ -16,6 +16,31 @@ case ":${XDG_CONFIG_DIRS-}:" in
     *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-$SESSION_TYPE:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
 esac
 
+# systemd's user manager holds a single graphical session per user: a second
+# gnome-session for the same user finds its target and bus names taken and
+# exits, dropping back to the login screen. When this user already runs a
+# graphical session, start a secondary session beside it instead: its own i3
+# on this login's display, without touching the user manager that the first
+# session owns. Any user without a running session keeps the gnome-session
+# path below, so every user gets one managed session plus any number of
+# secondary ones. An unreachable user manager means no session is running.
+regolith_x11_has_graphical_session() {
+    local unit
+    for unit in regolith-x11.service regolith-wayland.service \
+                gnome-session@regolith-x11.target gnome-session@regolith-wayland.target \
+                gnome-session.target; do
+        if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+if regolith_x11_has_graphical_session; then
+    export REGOLITH_X11_SECONDARY=1
+    exec /usr/bin/regolith-session-x11-secondary "$@"
+fi
+
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     source /etc/os-release

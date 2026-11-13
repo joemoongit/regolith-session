@@ -65,9 +65,24 @@ import_environment_d() {
 # them. i3 takes I3SOCK as the path for its own IPC socket, so it would listen
 # on the dead sway socket's path, and a stale SWAYSOCK makes tools believe
 # they run under sway. The window managers set the variables they need.
+# A secondary X11 login clears only its own environment: the user manager
+# still belongs to the first session, whose live I3SOCK must stay there.
 clear_wm_sockets() {
     unset I3SOCK SWAYSOCK
+    if [ -n "${REGOLITH_X11_SECONDARY-}" ]; then
+        return 0
+    fi
     systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
+}
+
+# Point the logout keybinding of a secondary X11 session at its own logout.
+# Secondary sessions share the session bus with the first session, so the
+# default logout command would log out the first session instead. Each X
+# server keeps its own resource database, so merging here changes only this
+# session's display. Callers re-apply this after rebuilding the resources.
+apply_secondary_logout_override() {
+    printf '%s\n' 'wm.program.logout: /usr/bin/regolith-session-x11-secondary-logout' \
+        | xrdb -merge 2>/dev/null || true
 }
 
 # Determine where the default i3 and sway config files are

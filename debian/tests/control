@@ -59,6 +59,14 @@ Depends: regolith-session-flashback,
          x11-xserver-utils
 Restrictions: allow-stderr
 
+Tests: x11-multi-session
+Depends: regolith-session-flashback,
+         dbus,
+         xvfb,
+         x11-xserver-utils,
+         xrescat
+Restrictions: allow-stderr
+
 Tests: ibus-wayland
 Depends: regolith-session-sway,
          ibus,

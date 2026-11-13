@@ -1,0 +1,22 @@
+#!/bin/bash
+# Start a secondary Regolith X11 session beside the user's systemd-managed
+# one. LightDM already set this login's DISPLAY and XAUTHORITY; this script
+# keeps them and runs i3 on them without registering with the first session's
+# gnome-session manager and without importing into or clearing the systemd
+# user environment, which keeps pointing at the first session.
+set -Eeu -o pipefail
+
+export REGOLITH_X11_SECONDARY=1
+unset DESKTOP_AUTOSTART_ID
+unset NOTIFY_SOCKET
+
+if [ -z "${XDG_CURRENT_DESKTOP-}" ]; then
+    export XDG_CURRENT_DESKTOP="Regolith:GNOME-Flashback:GNOME"
+fi
+
+case ":${XDG_CONFIG_DIRS-}:" in
+    *":/etc/xdg/xdg-regolith-x11:"*) ;;
+    *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-regolith-x11:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
+esac
+
+exec /usr/bin/regolith-session-x11
