@@ -22,6 +22,15 @@ Depends: regolith-session-flashback,
          x11-xserver-utils
 Restrictions: allow-stderr
 
+Tests: multiple-x11-sessions
+Depends: regolith-session-flashback,
+         regolith-session-common,
+         dbus,
+         xvfb,
+         x11-xserver-utils,
+         xrescat
+Restrictions: allow-stderr
+
 Tests: stale-wm-sockets
 Depends: regolith-session-flashback,
          regolith-session-sway,

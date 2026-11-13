@@ -1,0 +1,156 @@
+#!/bin/sh
+# Additional Regolith X11 logins for a user whose first session is already
+# running must get their own i3 on their own display instead of being sent
+# back to the greeter by a second gnome-session, without disturbing the
+# first session. A first login, and a login by another user whose own
+# first session is not running, must still go through gnome-session.
+# gnome-session and systemctl are stubbed: the systemctl stub reports the
+# first session and records the user manager's environment, so the test
+# can show the additional logins never change it.
+set -eu
+
+tmp=${AUTOPKGTEST_TMP:-$(mktemp -d)}
+export SESSION_TEST_TMP="$tmp"
+export HOME="$tmp/home" XDG_RUNTIME_DIR="$tmp/xdg"
+mkdir -p "$HOME/.config/regolith3/flags" "$XDG_RUNTIME_DIR" "$tmp/bin" \
+         "$tmp/home2/.config/regolith3/flags" "$tmp/xdg2"
+chmod 700 "$XDG_RUNTIME_DIR" "$tmp/xdg2"
+
+cat > "$tmp/bin/gnome-session" <<'EOF'
+#!/bin/sh
+echo "gnome-session $*" >> "$SESSION_TEST_TMP/gnome-session.log"
+exit 0
+EOF
+
+cat > "$tmp/bin/systemctl" <<'EOF'
+#!/bin/sh
+echo "systemctl $*" >> "$SESSION_TEST_TMP/systemctl.log"
+[ "${1-}" = "--user" ] && shift
+case "${1-}" in
+    is-active)
+        if [ -f "$XDG_RUNTIME_DIR/primary-active" ]; then
+            echo active; exit 0
+        fi
+        echo inactive; exit 3 ;;
+    unset-environment)
+        echo "unset-environment $*" >> "$SESSION_TEST_TMP/systemctl-env-changes.log"
+        shift
+        for var in "$@"; do
+            grep -v "^$var=" "$SESSION_TEST_TMP/manager.env" \
+                > "$SESSION_TEST_TMP/manager.env.new" || true
+            mv "$SESSION_TEST_TMP/manager.env.new" "$SESSION_TEST_TMP/manager.env"
+        done
+        exit 0 ;;
+    show-environment)
+        cat "$SESSION_TEST_TMP/manager.env"; exit 0 ;;
+    *)
+        exit 0 ;;
+esac
+EOF
+
+cat > "$tmp/bin/i3" <<'EOF'
+#!/bin/sh
+d=${DISPLAY:-none}; d=${d#:}
+env > "$SESSION_TEST_TMP/i3-$d.env"
+echo "$@" > "$SESSION_TEST_TMP/i3-$d.args"
+exit 0
+EOF
+chmod +x "$tmp/bin/gnome-session" "$tmp/bin/systemctl" "$tmp/bin/i3"
+
+displays=""
+for n in 1 2 3; do
+    Xvfb -displayfd 3 -screen 0 1280x800x24 -nolisten tcp -noreset \
+        3>"$tmp/display$n" >"$tmp/xvfb$n.log" 2>&1 &
+    displays="$displays $!"
+done
+trap 'for p in $displays; do kill $p 2>/dev/null || true; done' EXIT
+for n in 1 2 3; do
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$tmp/display$n" ] && break; sleep 0.5; done
+done
+D1=$(cat "$tmp/display1") D2=$(cat "$tmp/display2") D3=$(cat "$tmp/display3")
+
+cat > "$tmp/run" <<EOF2
+#!/bin/sh
+set -eu
+t="$tmp"
+fail=0
+check() { # check <description> <ok|fail>
+    if [ "\$2" = ok ]; then echo "ok: \$1"; else echo "FAIL: \$1"; fail=1; fi
+}
+
+# 1. Fresh login: no session of this user running, so it goes through
+#    gnome-session exactly as before.
+: > "\$t/gnome-session.log"
+env PATH="\$t/bin:\$PATH" DISPLAY=":$D1" XDG_SESSION_TYPE=x11 \
+    timeout 60 regolith-session-x11-launch >"\$t/fresh-launch.log" 2>&1 \
+    || { cat "\$t/fresh-launch.log"; fail=1; }
+if grep -q -- "--session=regolith-x11" "\$t/gnome-session.log"; then r=ok; else r=fail; fi
+check "fresh login starts through gnome-session" \$r
+if [ -e "\$t/i3-$D1.env" ]; then r=fail; else r=ok; fi
+check "fresh login does not start i3 without gnome-session" \$r
+
+# 2. Fresh session script: a stale I3SOCK/SWAYSOCK is still cleared, both
+#    from the window manager's environment and from the user manager.
+printf 'DISPLAY=:$D1\nXAUTHORITY=%s/first-auth\nI3SOCK=%s/stale.sock\nSWAYSOCK=%s/stale.sock\n' "\$t" "\$t" "\$t" > "\$t/manager.env"
+: > "\$t/systemctl-env-changes.log"
+env -u NOTIFY_SOCKET PATH="\$t/bin:\$PATH" DISPLAY=":$D1" XDG_SESSION_TYPE=x11 \
+    I3SOCK="\$t/stale.sock" SWAYSOCK="\$t/stale.sock" \
+    timeout 60 regolith-session-x11 >"\$t/fresh-session.log" 2>&1 \
+    || { cat "\$t/fresh-session.log"; fail=1; }
+if [ -f "\$t/i3-$D1.env" ] && ! grep -q "^I3SOCK=" "\$t/i3-$D1.env"; then r=ok; else r=fail; fi
+check "fresh session starts i3 without a stale I3SOCK" \$r
+if grep -q "unset-environment" "\$t/systemctl-env-changes.log"; then r=ok; else r=fail; fi
+check "fresh session clears stale sockets from the user manager" \$r
+rm -f "\$t/i3-$D1.env"
+
+# 3. Additional logins: the first session is running on :$D1 and the user
+#    manager's environment describes it. Two more logins in a row must
+#    each start their own i3, leave gnome-session and that environment
+#    alone, and get a logout that exits only their own i3.
+touch "\$XDG_RUNTIME_DIR/primary-active"
+printf 'DISPLAY=:$D1\nXAUTHORITY=%s/first-auth\nI3SOCK=%s/first-i3.sock\n' "\$t" "\$t" > "\$t/manager.env"
+cp "\$t/manager.env" "\$t/manager.env.expected"
+: > "\$t/gnome-session.log"
+: > "\$t/systemctl-env-changes.log"
+for d in $D2 $D3; do
+    env PATH="\$t/bin:\$PATH" DISPLAY=":\$d" XDG_SESSION_TYPE=x11 \
+        I3SOCK="\$t/first-i3.sock" SWAYSOCK="\$t/first-i3.sock" \
+        timeout 60 regolith-session-x11-launch >"\$t/extra-\$d.log" 2>&1 \
+        || { cat "\$t/extra-\$d.log"; fail=1; }
+    if [ -f "\$t/i3-\$d.env" ]; then r=ok; else r=fail; fi
+    check "additional login on :\$d starts its own i3" \$r
+    if [ -f "\$t/i3-\$d.env" ] && grep -q "^DISPLAY=:\$d\$" "\$t/i3-\$d.env"; then r=ok; else r=fail; fi
+    check "additional login on :\$d runs i3 on its own display" \$r
+    if [ -f "\$t/i3-\$d.env" ] && ! grep -q "^I3SOCK=" "\$t/i3-\$d.env"; then r=ok; else r=fail; fi
+    check "additional login on :\$d starts i3 without the first session's I3SOCK" \$r
+    logout=\$(DISPLAY=":\$d" xrdb -query | sed -n 's/^wm\.program\.logout:[[:space:]]*//p')
+    case "\$logout" in
+        *gnome-session-quit*|"") r=fail ;;
+        *i3-msg*exit*) r=ok ;;
+        *) r=fail ;;
+    esac
+    check "additional login on :\$d logs out by exiting only its own i3 (\$logout)" \$r
+done
+if [ -s "\$t/gnome-session.log" ]; then r=fail; else r=ok; fi
+check "additional logins do not start gnome-session again" \$r
+if cmp -s "\$t/manager.env" "\$t/manager.env.expected"; then r=ok; else r=fail; fi
+check "additional logins leave DISPLAY, XAUTHORITY and I3SOCK of the first session in the user manager" \$r
+if [ -s "\$t/systemctl-env-changes.log" ]; then r=fail; else r=ok; fi
+check "additional logins do not unset the first session's environment" \$r
+
+# 4. Another user: their first session is not running (their own runtime
+#    directory has no running session), so their login goes through
+#    gnome-session even while the first user has sessions open.
+: > "\$t/gnome-session.log"
+env PATH="\$t/bin:\$PATH" DISPLAY=":$D3" XDG_SESSION_TYPE=x11 \
+    HOME="\$t/home2" XDG_RUNTIME_DIR="\$t/xdg2" \
+    timeout 60 regolith-session-x11-launch >"\$t/user2-launch.log" 2>&1 \
+    || { cat "\$t/user2-launch.log"; fail=1; }
+if grep -q -- "--session=regolith-x11" "\$t/gnome-session.log"; then r=ok; else r=fail; fi
+check "another user's first login starts through gnome-session" \$r
+
+exit \$fail
+EOF2
+chmod +x "$tmp/run"
+
+AUTOPKGTEST_TMP="$tmp" dbus-run-session -- "$tmp/run"

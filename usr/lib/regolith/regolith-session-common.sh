@@ -65,9 +65,100 @@ import_environment_d() {
 # them. i3 takes I3SOCK as the path for its own IPC socket, so it would listen
 # on the dead sway socket's path, and a stale SWAYSOCK makes tools believe
 # they run under sway. The window managers set the variables they need.
+# In an additional X11 session (REGOLITH_X11_STANDALONE is set) the user
+# manager's environment belongs to the first session, so only drop the
+# variables from this process: unsetting them in the manager would remove
+# the first session's I3SOCK from under it.
 clear_wm_sockets() {
     unset I3SOCK SWAYSOCK
+    if [ -n "${REGOLITH_X11_STANDALONE-}" ]; then
+        return 0
+    fi
     systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
+}
+
+# Print the file used to claim the first (gnome-session) X11 session of this
+# user. The file lives in the per-user runtime directory, so each user has
+# their own and any number of additional sessions can tell that the first
+# one is still claiming it.
+regolith_x11_primary_lock_file() {
+    local dir="${XDG_RUNTIME_DIR-}"
+    if [ -z "$dir" ]; then
+        dir="/run/user/$(id -u)"
+    fi
+    [ -d "$dir" ] || return 1
+    printf '%s/regolith-x11-primary.lock' "$dir"
+}
+
+# Succeed if another process holds the first-session claim. Taking the lock
+# here is only a probe: on success it is released again at once.
+regolith_x11_primary_lock_held() {
+    local lock
+    command -v flock >/dev/null 2>&1 || return 1
+    lock=$(regolith_x11_primary_lock_file) || return 1
+    [ -e "$lock" ] || return 1
+    if (exec 9>"$lock"; flock -n 9) 2>/dev/null; then
+        return 1
+    fi
+    return 0
+}
+
+# Succeed if the systemd user manager says a Regolith X11 session is
+# already running for this user. The manager is per user, so other users'
+# sessions never count. gnome-session can only run once per manager: its
+# targets and regolith-x11.service are singletons and it refuses to start
+# a second session manager, which is what sent a second LightDM login
+# straight back to the greeter.
+regolith_x11_systemd_session_active() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    local unit state rc
+    for unit in regolith-x11.service \
+                "gnome-session@regolith-x11.target" \
+                "gnome-session-manager@regolith-x11.service" \
+                regolith-x11.target \
+                gnome-session.target \
+                graphical-session.target; do
+        rc=0
+        state=$(systemctl --user is-active "$unit" 2>/dev/null) || rc=$?
+        case "$state" in
+            active|activating) return 0 ;;
+            "") [ "$rc" -eq 0 ] && return 0 ;;
+        esac
+    done
+    return 1
+}
+
+# Succeed if a first Regolith X11 session of this user is already running,
+# by either the user manager's state or the first session's claim.
+regolith_x11_primary_session_active() {
+    regolith_x11_systemd_session_active && return 0
+    regolith_x11_primary_lock_held && return 0
+    return 1
+}
+
+# Claim the first-session role for this process and keep the claim across
+# the exec of gnome-session that follows: the lock is held on fd 9, which
+# the session leader inherits, and is released when that leader exits, so
+# a login after the first session has ended claims it again. Succeed if
+# this process claimed it, or if no claim can be made (no runtime
+# directory, no flock): then the caller still goes on as the first
+# session, as it did before claims existed, and the user manager's state
+# above is the check for further logins. Fail only if another process
+# holds the claim.
+regolith_x11_acquire_primary_lock() {
+    local lock rc
+    command -v flock >/dev/null 2>&1 || return 0
+    lock=$(regolith_x11_primary_lock_file) || return 0
+    exec 9>"$lock" 2>/dev/null || return 0
+    flock -n 9 2>/dev/null && return 0
+    rc=$?
+    [ "$rc" -eq 1 ] && return 1
+    return 0
+}
+
+# Drop this process's first-session claim, if it holds one.
+regolith_x11_release_primary_lock() {
+    exec 9>&- 2>/dev/null || true
 }
 
 # Determine where the default i3 and sway config files are

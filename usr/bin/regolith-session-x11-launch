@@ -16,6 +16,32 @@ case ":${XDG_CONFIG_DIRS-}:" in
     *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-$SESSION_TYPE:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
 esac
 
+# This user may already have a Regolith X11 session. gnome-session runs
+# only once per systemd user manager: it uploads DISPLAY and XAUTHORITY
+# into the manager and starts singleton targets and regolith-x11.service,
+# so a second gnome-session refuses to run and LightDM shows the greeter
+# again. An additional session therefore runs its own i3 directly on its
+# own display, without gnome-session and without touching the user
+# manager's environment, which still describes the first session. There
+# is no count or per-user special case: every further login of any user
+# whose first session is running takes this path, and each user's manager
+# and runtime directory keep their sessions apart.
+if [ -f /usr/lib/regolith/regolith-session-common.sh ]; then
+    # shellcheck disable=SC1091
+    source /usr/lib/regolith/regolith-session-common.sh
+
+    if regolith_x11_primary_session_active; then
+        export REGOLITH_X11_STANDALONE=1
+        exec regolith-session-x11
+    elif ! regolith_x11_acquire_primary_lock; then
+        regolith_x11_release_primary_lock
+        export REGOLITH_X11_STANDALONE=1
+        exec regolith-session-x11
+    fi
+    # No first session: keep the claim while gnome-session runs below, so
+    # a login racing this one, or one while it runs, takes the path above.
+fi
+
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     source /etc/os-release

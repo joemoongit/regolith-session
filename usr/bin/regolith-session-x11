@@ -5,6 +5,19 @@ set -Eeu -o pipefail
 
 source /usr/lib/regolith/regolith-session-common.sh
 
+# An additional session for a user whose first session is already running
+# runs standalone: directly by regolith-session-x11-launch, which sets
+# REGOLITH_X11_STANDALONE, or, when this script is reached without it,
+# by noticing the first session here. The systemd session (NOTIFY_SOCKET
+# is set) and a gnome-session that runs this script itself
+# (DESKTOP_AUTOSTART_ID is set) are the first session, never an addition.
+if [ -z "${REGOLITH_X11_STANDALONE-}" ] \
+   && [ -z "${NOTIFY_SOCKET-}" ] \
+   && [ -z "${DESKTOP_AUTOSTART_ID-}" ] \
+   && regolith_x11_primary_session_active; then
+    export REGOLITH_X11_STANDALONE=1
+fi
+
 gdm3_xrdb_fixup() {
     if xrescat testkey defaultval > /dev/null 2>&1; then
         echo "xrdb appears to be property initialized, skipping xrdb init"
@@ -20,7 +33,10 @@ if [ -z "${NOTIFY_SOCKET-}" ]; then
   # Register with gnome-session so that it does not kill the whole session thinking it is dead.
   # When gnome-session respawns us after i3 crashed, the client is still
   # registered and this fails with AlreadyRegistered; i3 must start anyway.
-  if [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
+  # An additional session has no gnome-session of its own: the session bus
+  # name belongs to the first session's manager, so it must not register
+  # there either.
+  if [ -z "${REGOLITH_X11_STANDALONE-}" ] && [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
       dbus-send --print-reply --session --dest=org.gnome.SessionManager "/org/gnome/SessionManager" org.gnome.SessionManager.RegisterClient "string:Regolith-X11" "string:$DESKTOP_AUTOSTART_ID" \
           || echo "Could not register with gnome-session, continuing"
   fi
@@ -34,6 +50,20 @@ clear_wm_sockets    # SWAYSOCK and I3SOCK of an earlier session
 
 gdm3_xrdb_fixup     # Remove when https://bugs.launchpad.net/ubuntu/+source/gdm3/+bug/1955850 is fixed
 load_i3_resources   # ~/.Xresources, ~/.config/regolith3/Xresources and the look, as 'regolith-look refresh' does
+
+if [ -n "${REGOLITH_X11_STANDALONE-}" ]; then
+    # The usual logout program, gnome-session-quit, talks to the first
+    # session's manager on the shared session bus and would log that
+    # session out instead of this one. Exit only this session's i3: it is
+    # found through this display, not through an I3SOCK inherited from
+    # another session, and when it exits this script returns and LightDM
+    # ends only this session. Merged after the resources above, this wins
+    # over the look's and the user's wm.program.logout for this display
+    # only; the first session's resources are on its own display.
+    printf '%s\n' 'wm.program.logout: env -u I3SOCK i3-msg exit' \
+        | xrdb -nocpp -merge \
+        || echo "Could not set the additional session's logout program, continuing"
+fi
 
 UPDATE_FLAG_DIR="$HOME/.config/regolith3/flags"
 if [ ! -e "$UPDATE_FLAG_DIR" ]; then
