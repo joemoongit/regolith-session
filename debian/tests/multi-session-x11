@@ -1,0 +1,179 @@
+#!/bin/sh
+# Additional X11 logins for a user whose Regolith session is already
+# running must start their own i3 on their own display instead of a
+# second gnome-session, which cannot start for that user. They must not
+# change the primary session's DISPLAY, XAUTHORITY or I3SOCK in the
+# systemd user manager, and logging one out through its wm.program.logout
+# resource must close only that session. A login with no session running
+# still goes through gnome-session. Several additional sessions, for
+# more than one user, run at the same time. gnome-session, systemctl and
+# the window managers are stubbed; the session scripts are real.
+set -eu
+
+tmp=${AUTOPKGTEST_TMP:-$(mktemp -d)}
+mkdir -p "$tmp/bin" "$tmp/mgr1" "$tmp/mgr2" "$tmp/runtime1" "$tmp/runtime2" \
+         "$tmp/home1/.config/regolith3/flags" "$tmp/home2/.config/regolith3/flags"
+chmod 700 "$tmp/runtime1" "$tmp/runtime2"
+export XDG_RUNTIME_DIR="$tmp/runtime1"
+
+# gnome-session records that it ran and exits, as a first login's does
+# once its session is up.
+cat > "$tmp/bin/gnome-session" <<EOF
+#!/bin/sh
+echo "gnome-session DISPLAY=\$DISPLAY HOME=\$HOME \$*" >> "$tmp/gnome.log"
+EOF
+# systemctl stands in for one user's manager, selected by FAKE_MANAGER_DIR.
+cat > "$tmp/bin/systemctl" <<EOF
+#!/bin/sh
+mgr=\${FAKE_MANAGER_DIR:-$tmp/mgr1}
+echo "systemctl \$*" >> "\$mgr/calls"
+while [ \$# -gt 0 ]; do case \$1 in --user|--quiet) shift;; *) break;; esac; done
+cmd=\${1-}; [ \$# -gt 0 ] && shift
+last=
+for a in "\$@"; do last=\$a; done
+case \$cmd in
+    is-active)
+        grep -qx "\$last" "\$mgr/active" 2>/dev/null; exit \$? ;;
+    show-environment)
+        cat "\$mgr/environment" ;;
+    unset-environment|set-environment|import-environment)
+        for v in "\$@"; do
+            n=\${v%%=*}
+            sed -i "/^\$n=/d" "\$mgr/environment"
+            case \$v in *=*) echo "\$v" >> "\$mgr/environment";; esac
+        done ;;
+esac
+exit 0
+EOF
+# i3 records its environment and stays running; i3-msg exit ends the i3
+# for its DISPLAY, as i3-msg finds that display's i3.
+cat > "$tmp/bin/i3" <<EOF
+#!/bin/sh
+key=\$(echo "\$DISPLAY" | tr ':' '_')
+env > "$tmp/i3\$key.env"
+echo \$\$ > "$tmp/i3\$key.pid"
+exec sleep 3600
+EOF
+cat > "$tmp/bin/i3-msg" <<EOF
+#!/bin/sh
+key=\$(echo "\$DISPLAY" | tr ':' '_')
+[ "\${1-}" = exit ] && kill "\$(cat "$tmp/i3\$key.pid")" 2>/dev/null
+exit 0
+EOF
+chmod +x "$tmp/bin/gnome-session" "$tmp/bin/systemctl" "$tmp/bin/i3" "$tmp/bin/i3-msg"
+: > "$tmp/mgr1/active"; : > "$tmp/mgr2/active"; : > "$tmp/gnome.log"
+
+displays=""
+start_x() { # start_x <name>
+    Xvfb -displayfd 3 -screen 0 640x480x24 -nolisten tcp -noreset \
+        3>"$tmp/display-$1" >"$tmp/xvfb-$1.log" 2>&1 &
+    displays="$displays $!"
+}
+start_x d0; start_x d1; start_x d2; start_x d3
+trap 'kill $displays 2>/dev/null || true' EXIT
+for n in d0 d1 d2 d3; do
+    for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$tmp/display-$n" ] && break; sleep 0.5; done
+done
+
+cat > "$tmp/run" <<'EOF2'
+#!/bin/sh
+set -u
+t=$AUTOPKGTEST_TMP
+fail=0
+trap 'kill $(jobs -p) 2>/dev/null || true' EXIT
+note() { if [ "$1" -eq 0 ]; then echo "ok: $2"; else echo "FAIL: $2"; fail=1; fi; }
+wait_file() { # wait_file <path>
+    for _ in $(seq 1 60); do [ -s "$1" ] && return 0; sleep 0.5; done
+    return 1
+}
+alive() { kill -0 "$1" 2>/dev/null; }
+
+D0=":$(cat "$t/display-d0")"; D1=":$(cat "$t/display-d1")"
+D2=":$(cat "$t/display-d2")"; D3=":$(cat "$t/display-d3")"
+printf 'DISPLAY=%s\nXAUTHORITY=%s\nI3SOCK=%s\n' "$D0" "$t/home1/.Xauthority" \
+    "$t/runtime1/i3/ipc-socket.1111" > "$t/mgr1/environment"
+cp "$t/mgr1/environment" "$t/mgr1/environment.want"
+printf 'DISPLAY=%s\nXAUTHORITY=%s\nI3SOCK=%s\n' "$D3" "$t/home2/.Xauthority" \
+    "$t/runtime2/i3/ipc-socket.2222" > "$t/mgr2/environment"
+cp "$t/mgr2/environment" "$t/mgr2/environment.want"
+
+# 1. No session running: the login goes through gnome-session, for
+#    either user, and starts no i3 directly.
+for u in 1 2; do
+    env -u NOTIFY_SOCKET FAKE_MANAGER_DIR="$t/mgr$u" HOME="$t/home$u" \
+        XDG_RUNTIME_DIR="$t/runtime$u" DISPLAY="$D0" PATH="$t/bin:$PATH" \
+        timeout 30 regolith-session-x11-launch >"$t/fresh$u.log" 2>&1
+    note $? "fresh login for user $u runs the launcher"
+done
+[ "$(grep -c gnome-session "$t/gnome.log")" -eq 2 ]
+note $? "both fresh logins went through gnome-session"
+[ ! -e "$t/i3$(echo "$D0" | tr ':' '_').env" ]
+note $? "fresh logins started no i3 directly"
+
+# 2. Both users now have a primary session: its units are active in
+#    their managers and its i3 (on D0 for user 1) is running.
+echo regolith-x11.service > "$t/mgr1/active"
+echo regolith-x11.service > "$t/mgr2/active"
+env HOME="$t/home1" DISPLAY="$D0" PATH="$t/bin:$PATH" "$t/bin/i3" &
+primary_i3=$!
+wait_file "$t/i3$(echo "$D0" | tr ':' '_').env"; note $? "primary i3 is running"
+
+launch_extra() { # launch_extra <user> <display> <log>
+    env -u NOTIFY_SOCKET FAKE_MANAGER_DIR="$t/mgr$1" HOME="$t/home$1" \
+        XDG_RUNTIME_DIR="$t/runtime$1" DISPLAY="$2" \
+        I3SOCK="$t/runtime$1/i3/ipc-socket.1111" SWAYSOCK="$t/runtime$1/stale.sock" \
+        XDG_SESSION_TYPE=x11 PATH="$t/bin:$PATH" \
+        timeout 120 regolith-session-x11-launch >"$3" 2>&1 &
+    echo $!
+}
+extra1=$(launch_extra 1 "$D1" "$t/extra1.log")
+extra2=$(launch_extra 1 "$D2" "$t/extra2.log")
+extra3=$(launch_extra 2 "$D3" "$t/extra3.log")
+for d in "$D1" "$D2" "$D3"; do
+    wait_file "$t/i3$(echo "$d" | tr ':' '_').env"
+    note $? "additional session on $d started its i3"
+done
+sleep 1
+alive "$extra1" && alive "$extra2" && alive "$extra3"
+note $? "all additional sessions stay running together"
+[ "$(grep -c gnome-session "$t/gnome.log")" -eq 2 ]
+note $? "additional logins did not start another gnome-session"
+cmp -s "$t/mgr1/environment" "$t/mgr1/environment.want" \
+    && cmp -s "$t/mgr2/environment" "$t/mgr2/environment.want"
+note $? "user managers still hold the primary sessions' environment"
+for d in "$D1" "$D2" "$D3"; do
+    f="$t/i3$(echo "$d" | tr ':' '_').env"
+    grep -q "^DISPLAY=$d\$" "$f" && ! grep -q '^I3SOCK=' "$f" && ! grep -q '^SWAYSOCK=' "$f"
+    note $? "i3 on $d has its own display and no inherited WM socket"
+    prog=$(DISPLAY="$d" xrescat wm.program.logout 2>/dev/null)
+    [ "$prog" = "i3-msg exit" ]
+    note $? "logout on $d is session-local ($prog)"
+done
+
+# 3. Logging out of one additional session closes only that session.
+prog=$(DISPLAY="$D1" xrescat wm.program.logout)
+env DISPLAY="$D1" PATH="$t/bin:$PATH" sh -c "$prog"
+for _ in $(seq 1 40); do alive "$extra1" || break; sleep 0.5; done
+alive "$extra1"; [ $? -ne 0 ]; note $? "logged-out additional session ended"
+alive "$extra2" && alive "$extra3" && alive "$primary_i3"
+note $? "the primary and other additional sessions keep running"
+cmp -s "$t/mgr1/environment" "$t/mgr1/environment.want" \
+    && cmp -s "$t/mgr2/environment" "$t/mgr2/environment.want"
+note $? "user managers unchanged after the additional logout"
+kill "$extra2" "$extra3" "$primary_i3" 2>/dev/null || true
+for f in "$t"/i3*.pid; do kill "$(cat "$f")" 2>/dev/null || true; done
+sleep 1
+
+# 4. Once every session has ended, a login is fresh again even though
+#    the managers still hold the ended sessions' stale environment.
+: > "$t/mgr1/active"; : > "$t/mgr2/active"
+env -u NOTIFY_SOCKET FAKE_MANAGER_DIR="$t/mgr1" HOME="$t/home1" \
+    XDG_RUNTIME_DIR="$t/runtime1" DISPLAY="$D1" PATH="$t/bin:$PATH" \
+    timeout 30 regolith-session-x11-launch >"$t/fresh-again.log" 2>&1
+note $? "login after all sessions ended runs the launcher"
+[ "$(grep -c gnome-session "$t/gnome.log")" -eq 3 ]
+note $? "login after all sessions ended went through gnome-session"
+exit $fail
+EOF2
+chmod +x "$tmp/run"
+AUTOPKGTEST_TMP="$tmp" HOME="$tmp/home1" dbus-run-session -- "$tmp/run"

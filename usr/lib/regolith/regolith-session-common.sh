@@ -67,7 +67,12 @@ import_environment_d() {
 # they run under sway. The window managers set the variables they need.
 clear_wm_sockets() {
     unset I3SOCK SWAYSOCK
-    systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
+    # In an additional X11 session the user manager's environment belongs
+    # to the primary session, whose sockets are live, not stale: only
+    # clear this session's own environment there.
+    if [ -z "${REGOLITH_X11_ADDITIONAL_SESSION-}" ]; then
+        systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
+    fi
 }
 
 # Determine where the default i3 and sway config files are

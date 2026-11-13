@@ -20,7 +20,9 @@ if [ -z "${NOTIFY_SOCKET-}" ]; then
   # Register with gnome-session so that it does not kill the whole session thinking it is dead.
   # When gnome-session respawns us after i3 crashed, the client is still
   # registered and this fails with AlreadyRegistered; i3 must start anyway.
-  if [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
+  # An additional session has no gnome-session of its own: registering
+  # would reach the primary session's session manager.
+  if [ -z "${REGOLITH_X11_ADDITIONAL_SESSION-}" ] && [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
       dbus-send --print-reply --session --dest=org.gnome.SessionManager "/org/gnome/SessionManager" org.gnome.SessionManager.RegisterClient "string:Regolith-X11" "string:$DESKTOP_AUTOSTART_ID" \
           || echo "Could not register with gnome-session, continuing"
   fi
@@ -49,6 +51,17 @@ if [ ! -e "$UPDATE_FLAG_DIR" ]; then
         # 'regolith-look refresh' or 'regolith-look set' apply it again
         mkdir -p "$UPDATE_FLAG_DIR"
     fi
+fi
+
+if [ -n "${REGOLITH_X11_ADDITIONAL_SESSION-}" ]; then
+    # The default logout program talks to gnome-session, which in an
+    # additional session is the primary session's manager: logging out
+    # there would end that session instead. Point this display's logout
+    # at this display's i3 only. i3 reads wm.program.logout from this
+    # display's resource database when it starts, and i3-msg finds this
+    # display's i3 through DISPLAY and the socket i3 gives its children.
+    # Merged after load_i3_resources so no look or user file replaces it.
+    printf '%s\n' 'wm.program.logout: i3-msg exit' | xrdb -nocpp -merge
 fi
 
 resolve_default_config_file
