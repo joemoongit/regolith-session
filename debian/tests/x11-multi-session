@@ -1,0 +1,150 @@
+#!/bin/sh
+# A second X11 login for a user who already has a graphical session cannot go
+# through a second gnome-session: the systemd user manager's session units are
+# singletons per user, so it fails and drops back to the login screen. Extra
+# logins must instead run without gnome-session or the user manager, as their
+# own i3 on their own display, with their own logout, leaving the first
+# session's DISPLAY, XAUTHORITY and I3SOCK in the user manager alone.
+#  1. A fresh login (no session running) still goes through gnome-session.
+#  2. Extra logins run i3 directly, restore the first session's DISPLAY and
+#     XAUTHORITY in the user manager (their Xsession overwrote them), never
+#     unset I3SOCK there, and log out with i3-msg exit on their own display
+#     only. Two extras prove there is no single-extra limit.
+#  3. A fresh session script still clears stale I3SOCK/SWAYSOCK, including in
+#     the user manager; an extra one clears only its own environment.
+set -eu
+
+tmp=${AUTOPKGTEST_TMP:-$(mktemp -d)}
+export HOME="$tmp/home" XDG_RUNTIME_DIR="$tmp/xdg"
+mkdir -p "$HOME/.config/regolith3/flags" "$XDG_RUNTIME_DIR" "$tmp/bin"
+chmod 700 "$XDG_RUNTIME_DIR"
+fail=0
+
+# Stubs record what the login paths call. systemctl pretends a graphical
+# session runs when PROBE_ACTIVE=1.
+cat > "$tmp/bin/systemctl" <<EOF
+#!/bin/sh
+echo "systemctl \$*" >> "$tmp/systemctl.log"
+case " \$* " in
+    *" is-active "*) [ "\${PROBE_ACTIVE-0}" = 1 ] ;;
+    *) exit 0 ;;
+esac
+EOF
+cat > "$tmp/bin/gnome-session" <<EOF
+#!/bin/sh
+echo "gnome-session \$*" >> "$tmp/calls.log"
+exit 0
+EOF
+cat > "$tmp/bin/dbus-send" <<EOF
+#!/bin/sh
+echo "dbus-send \$*" >> "$tmp/dbus.log"
+exit 0
+EOF
+cat > "$tmp/bin/pgrep" <<'EOF'
+#!/bin/sh
+exit 1
+EOF
+# i3 records its own environment and the logout resource on its display.
+cat > "$tmp/bin/i3" <<EOF
+#!/bin/sh
+{
+    echo "i3 DISPLAY=\$DISPLAY RUN=\$RUN"
+    [ -z "\${I3SOCK-}" ] || echo "i3 I3SOCK=\$I3SOCK"
+    [ -z "\${SWAYSOCK-}" ] || echo "i3 SWAYSOCK=\$SWAYSOCK"
+    xrdb -query 2>/dev/null | grep -i 'program.logout' || echo "i3 no-logout-override"
+} >> "$tmp/calls.log"
+exit 0
+EOF
+chmod +x "$tmp/bin/systemctl" "$tmp/bin/gnome-session" "$tmp/bin/dbus-send" \
+         "$tmp/bin/pgrep" "$tmp/bin/i3"
+
+# Three X servers: the first session's display and two extra logins' own.
+for d in 97 98 99; do
+    Xvfb ":$d" -screen 0 800x600x24 -nolisten tcp -noreset \
+        >"$tmp/xvfb-$d.log" 2>&1 &
+    echo $! > "$tmp/xvfb-$d.pid"
+done
+trap 'for d in 97 98 99; do kill "$(cat "$tmp/xvfb-$d.pid")" 2>/dev/null || true; done' EXIT
+for d in 97 98 99; do
+    for _ in 1 2 3 4 5 6 7 8 9 10; do
+        DISPLAY=":$d" xrdb -query >/dev/null 2>&1 && break; sleep 0.5
+    done
+    echo "init: 1" | DISPLAY=":$d" xrdb -load
+done
+
+export PATH="$tmp/bin:$PATH"
+
+ok() { echo "ok: $1"; }
+bad() { echo "FAIL: $1"; fail=1; }
+
+# 1. Fresh login on :98: through gnome-session, recording its environment.
+rm -f "$tmp/calls.log" "$tmp/systemctl.log"
+PROBE_ACTIVE=0 DISPLAY=:98 XAUTHORITY="$tmp/xauth98" \
+    DESKTOP_AUTOSTART_ID= AUTOPKGTEST_TMP="$tmp" \
+    dbus-run-session -- regolith-session-x11-launch >/dev/null 2>&1 || true
+grep -q '^gnome-session --session=regolith-x11' "$tmp/calls.log" 2>/dev/null \
+    && ok "fresh login starts through gnome-session" \
+    || { bad "fresh login did not start gnome-session"; cat "$tmp/calls.log" 2>/dev/null || true; }
+grep -q '^i3 ' "$tmp/calls.log" 2>/dev/null \
+    && { bad "fresh login ran i3 directly instead of gnome-session"; } \
+    || ok "fresh login does not run i3 directly"
+[ -f "$XDG_RUNTIME_DIR/regolith-x11-primary-env" ] \
+    && grep -q '^DISPLAY=:98$' "$XDG_RUNTIME_DIR/regolith-x11-primary-env" \
+    && grep -q "^XAUTHORITY=$tmp/xauth98$" "$XDG_RUNTIME_DIR/regolith-x11-primary-env" \
+    && ok "fresh login records its DISPLAY and XAUTHORITY" \
+    || { bad "fresh login did not record its environment"; cat "$XDG_RUNTIME_DIR/regolith-x11-primary-env" 2>/dev/null || true; }
+
+# 2. Extra logins on :99 and :97: their own i3, first session left alone.
+for d in 99 97; do
+    rm -f "$tmp/calls.log" "$tmp/systemctl.log" "$tmp/dbus.log"
+    PROBE_ACTIVE=1 DISPLAY=":$d" XAUTHORITY="$tmp/xauth$d" \
+        I3SOCK="$tmp/stale.sock" SWAYSOCK="$tmp/stale.sock" \
+        DESKTOP_AUTOSTART_ID="extra-$d" RUN="extra-$d" \
+        dbus-run-session -- regolith-session-x11-launch >"$tmp/launch-$d.log" 2>&1 || true
+    grep -q '^gnome-session ' "$tmp/calls.log" 2>/dev/null \
+        && bad "extra login on :$d started a second gnome-session" \
+        || ok "extra login on :$d does not start gnome-session"
+    grep -q "^i3 DISPLAY=:$d RUN=extra-$d$" "$tmp/calls.log" 2>/dev/null \
+        && ok "extra login on :$d runs its own i3 on :$d" \
+        || { bad "extra login on :$d did not run i3 on :$d"; cat "$tmp/calls.log" 2>/dev/null || true; cat "$tmp/launch-$d.log" 2>/dev/null || true; }
+    grep -q '^i3 I3SOCK=' "$tmp/calls.log" 2>/dev/null \
+        && bad "extra i3 on :$d inherited the stale I3SOCK" \
+        || ok "extra i3 on :$d starts without I3SOCK"
+    grep -q '^i3 SWAYSOCK=' "$tmp/calls.log" 2>/dev/null \
+        && bad "extra i3 on :$d inherited the stale SWAYSOCK" \
+        || ok "extra i3 on :$d starts without SWAYSOCK"
+    grep -q 'set-environment DISPLAY=:98$' "$tmp/systemctl.log" 2>/dev/null \
+        && grep -q "set-environment XAUTHORITY=$tmp/xauth98$" "$tmp/systemctl.log" 2>/dev/null \
+        && ok "extra login on :$d restores the first DISPLAY and XAUTHORITY" \
+        || { bad "extra login on :$d did not restore the first session"; cat "$tmp/systemctl.log" 2>/dev/null || true; }
+    grep -q 'unset-environment' "$tmp/systemctl.log" 2>/dev/null \
+        && { bad "extra login on :$d touched the user manager sockets"; cat "$tmp/systemctl.log" || true; } \
+        || ok "extra login on :$d leaves the user manager I3SOCK alone"
+    grep -q '^DISPLAY=:98$' "$XDG_RUNTIME_DIR/regolith-x11-primary-env" 2>/dev/null \
+        && ok "extra login on :$d keeps the recorded first session" \
+        || { bad "extra login on :$d overwrote the recorded first session"; cat "$XDG_RUNTIME_DIR/regolith-x11-primary-env" 2>/dev/null || true; }
+    [ -s "$tmp/dbus.log" ] \
+        && { bad "extra login on :$d registered with the first manager"; cat "$tmp/dbus.log" || true; } \
+        || ok "extra login on :$d does not register with gnome-session"
+    DISPLAY=":$d" xrdb -query 2>/dev/null | grep -qi 'wm.program.logout:.*i3-msg exit' \
+        && ok "extra login on :$d logs out with its own i3" \
+        || { bad "extra login on :$d has no own logout"; DISPLAY=":$d" xrdb -query 2>/dev/null | grep -i logout || true; }
+done
+
+# The first display keeps its own logout: no i3 exit there.
+DISPLAY=:98 xrdb -query 2>/dev/null | grep -qi 'wm.program.logout' \
+    && { bad "the first display gained the extra logout"; DISPLAY=:98 xrdb -query 2>/dev/null | grep -i logout || true; } \
+    || ok "the first display keeps its logout command"
+
+# 3. The session script itself: fresh clears the manager too, extra does not.
+rm -f "$tmp/calls.log" "$tmp/systemctl.log"
+DISPLAY=:98 I3SOCK="$tmp/stale.sock" SWAYSOCK="$tmp/stale.sock" RUN=fresh \
+    dbus-run-session -- regolith-session-x11 >/dev/null 2>&1 || true
+grep -q 'unset-environment I3SOCK SWAYSOCK' "$tmp/systemctl.log" 2>/dev/null \
+    && ok "fresh session clears stale sockets from the user manager" \
+    || { bad "fresh session did not clear the user manager"; cat "$tmp/systemctl.log" 2>/dev/null || true; }
+grep -q '^i3 I3SOCK=' "$tmp/calls.log" 2>/dev/null \
+    && bad "fresh session handed i3 the stale I3SOCK" \
+    || ok "fresh session starts i3 without the stale sockets"
+
+exit $fail

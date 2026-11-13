@@ -3,6 +3,73 @@ set -Eeu -o pipefail
 
 SESSION_TYPE="regolith-x11"
 
+# File holding the first (systemd-managed) session's display environment, so
+# extra logins can put it back into the user manager after their own Xsession
+# overwrites it there with dbus-update-activation-environment --systemd.
+regolith_primary_env_file() {
+    echo "${XDG_RUNTIME_DIR:-/run/user/$(id -u)}/regolith-x11-primary-env"
+}
+
+# True when this user already runs a graphical session in the systemd user
+# manager. A second gnome-session would reuse its singleton session units and
+# fail, dropping the new login back to the login screen. Fails open to the
+# normal path when the user manager is not reachable.
+regolith_has_graphical_session() {
+    local unit
+    for unit in regolith-x11.service regolith-x11.target \
+                gnome-session@regolith-x11.target \
+                regolith-wayland.service regolith-wayland.target \
+                gnome-session@regolith-wayland.target \
+                gnome-session-initialized.target gnome-session.target \
+                graphical-session.target; do
+        if systemctl --user is-active --quiet "$unit" 2>/dev/null; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+regolith_save_primary_env() {
+    local file
+    file=$(regolith_primary_env_file)
+    {
+        [ -n "${DISPLAY-}" ] && printf 'DISPLAY=%s\n' "$DISPLAY"
+        [ -n "${XAUTHORITY-}" ] && printf 'XAUTHORITY=%s\n' "$XAUTHORITY"
+    } > "$file" 2>/dev/null || true
+}
+
+# Put the first session's DISPLAY and XAUTHORITY back into the user manager,
+# which this login's Xsession replaced with this display's own. I3SOCK needs
+# no restoring: nothing in the login path overwrites it, and the extra session
+# never unsets it there (see clear_wm_sockets).
+regolith_restore_primary_env() {
+    local file display="" xauthority="" line
+    file=$(regolith_primary_env_file)
+    if [ -f "$file" ]; then
+        while IFS= read -r line; do
+            case $line in
+                DISPLAY=*) display=${line#DISPLAY=} ;;
+                XAUTHORITY=*) xauthority=${line#XAUTHORITY=} ;;
+            esac
+        done < "$file"
+    fi
+    # Without the file (the first session started before this was installed),
+    # read the values from its gnome-session process, which keeps them in its
+    # own environment. Only the first session runs gnome-session.
+    if [ -z "$display" ] || [ -z "$xauthority" ]; then
+        local pid env
+        for pid in $(pgrep -u "$(id -u)" -x gnome-session 2>/dev/null || true; pgrep -u "$(id -u)" -x gnome-session-service 2>/dev/null || true); do
+            [ -r "/proc/$pid/environ" ] || continue
+            env=$(tr '\0' '\n' < "/proc/$pid/environ" 2>/dev/null) || continue
+            [ -z "$display" ] && display=$(printf '%s\n' "$env" | sed -n 's/^DISPLAY=//p' | head -n 1)
+            [ -z "$xauthority" ] && xauthority=$(printf '%s\n' "$env" | sed -n 's/^XAUTHORITY=//p' | head -n 1)
+            [ -n "$display" ] && [ -n "$xauthority" ] && break
+        done
+    fi
+    [ -n "$display" ] && systemctl --user set-environment "DISPLAY=$display" 2>/dev/null || true
+    [ -n "$xauthority" ] && systemctl --user set-environment "XAUTHORITY=$xauthority" 2>/dev/null || true
+}
+
 if [ -z "${XDG_CURRENT_DESKTOP-}" ]; then
     export XDG_CURRENT_DESKTOP="Regolith:GNOME-Flashback:GNOME"
 fi
@@ -15,6 +82,24 @@ case ":${XDG_CONFIG_DIRS-}:" in
     *":/etc/xdg/xdg-$SESSION_TYPE:"*) ;;
     *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-$SESSION_TYPE:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
 esac
+
+# An extra login for a user who already has a graphical session cannot go
+# through a second gnome-session: systemd's session units are singletons per
+# user (and gnome-session 49 no longer has --builtin for a second one), so it
+# would fail and drop back to the login screen. Run it without gnome-session
+# and without the user manager instead, as its own i3 on this display, with
+# its own logout. There is no fixed limit: every extra login takes this path
+# while the first session runs, for any number of users and sessions.
+if [ -n "${REGOLITH_EXTRA_SESSION-}" ] || regolith_has_graphical_session; then
+    regolith_restore_primary_env || true
+    unset DESKTOP_AUTOSTART_ID
+    export REGOLITH_EXTRA_SESSION=1
+    exec regolith-session-x11
+fi
+
+# This login becomes the user's (only) systemd-managed session: record its
+# display environment for extra logins to restore.
+regolith_save_primary_env || true
 
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091

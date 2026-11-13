@@ -20,7 +20,9 @@ if [ -z "${NOTIFY_SOCKET-}" ]; then
   # Register with gnome-session so that it does not kill the whole session thinking it is dead.
   # When gnome-session respawns us after i3 crashed, the client is still
   # registered and this fails with AlreadyRegistered; i3 must start anyway.
-  if [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
+  # An extra session has no gnome-session of its own; never register with the
+  # first session's manager over the shared user bus.
+  if [ -z "${REGOLITH_EXTRA_SESSION-}" ] && [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
       dbus-send --print-reply --session --dest=org.gnome.SessionManager "/org/gnome/SessionManager" org.gnome.SessionManager.RegisterClient "string:Regolith-X11" "string:$DESKTOP_AUTOSTART_ID" \
           || echo "Could not register with gnome-session, continuing"
   fi
@@ -34,6 +36,14 @@ clear_wm_sockets    # SWAYSOCK and I3SOCK of an earlier session
 
 gdm3_xrdb_fixup     # Remove when https://bugs.launchpad.net/ubuntu/+source/gdm3/+bug/1955850 is fixed
 load_i3_resources   # ~/.Xresources, ~/.config/regolith3/Xresources and the look, as 'regolith-look refresh' does
+
+if [ -n "${REGOLITH_EXTRA_SESSION-}" ]; then
+    # An extra session has no gnome-session to log out from: gnome-session-quit
+    # over the shared user bus would log out the first session. Log out by
+    # exiting this session's own i3 instead, which ends only this login.
+    # xrdb is per display, so the first session keeps its own logout command.
+    printf 'wm.program.logout: i3-msg exit\n' | xrdb -nocpp -merge 2>/dev/null || true
+fi
 
 UPDATE_FLAG_DIR="$HOME/.config/regolith3/flags"
 if [ ! -e "$UPDATE_FLAG_DIR" ]; then

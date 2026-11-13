@@ -65,9 +65,14 @@ import_environment_d() {
 # them. i3 takes I3SOCK as the path for its own IPC socket, so it would listen
 # on the dead sway socket's path, and a stale SWAYSOCK makes tools believe
 # they run under sway. The window managers set the variables they need.
+# An extra X11 session (REGOLITH_EXTRA_SESSION) runs alongside the first one:
+# it drops the variables from its own environment only, leaving the user
+# manager's I3SOCK pointing at the first session.
 clear_wm_sockets() {
     unset I3SOCK SWAYSOCK
-    systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
+    if [ -z "${REGOLITH_EXTRA_SESSION-}" ]; then
+        systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
+    fi
 }
 
 # Determine where the default i3 and sway config files are

@@ -191,3 +191,10 @@ Tests: bar-blocks
 Depends: regolith-session-flashback,
          i3status-rs
 Restrictions: allow-stderr, skippable, skip-not-installable
+
+Tests: x11-multi-session
+Depends: regolith-session-flashback,
+         dbus,
+         xvfb,
+         x11-xserver-utils
+Restrictions: allow-stderr
