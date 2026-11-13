@@ -16,6 +16,40 @@ case ":${XDG_CONFIG_DIRS-}:" in
     *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-$SESSION_TYPE:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
 esac
 
+# A second gnome-session for this user cannot run: there is one systemd
+# user manager and one session bus per user, so its units (above all
+# regolith-x11.service) and its org.gnome.SessionManager name are already
+# taken by the first session, and starting it would also overwrite the
+# DISPLAY, XAUTHORITY and I3SOCK the manager records for that session.
+# When a Regolith X11 session of this user is already running, start an
+# additional session directly instead: its own regolith-session-x11, hence
+# its own i3, on this login's own display, as a child of this login, so it
+# lives and ends with this login only. This has no per-user state, unit or
+# display of its own, so any number of logins, of any user, can do it:
+# each user's manager is separate, and each additional session is just
+# another process on its own display.
+if [ -n "${HOME-}" ] && [ -r /usr/lib/regolith/regolith-session-common.sh ]; then
+    # shellcheck disable=SC1091
+    source /usr/lib/regolith/regolith-session-common.sh
+fi
+if ! declare -F regolith_x11_session_active >/dev/null 2>&1; then
+    # The common file is not there (or too old to know): ask the manager
+    # about the one unit an ordinary session always has running.
+    regolith_x11_session_active() {
+        local state
+        state=$(systemctl --user is-active regolith-x11.service 2>/dev/null) || true
+        [ "$state" = active ] || [ "$state" = activating ]
+    }
+fi
+
+if regolith_x11_session_active; then
+    export REGOLITH_X11_ADDITIONAL_SESSION=1
+    # Not a systemd service and not a gnome-session component: neither may
+    # act as if it were (notify the manager, register with gnome-session).
+    unset NOTIFY_SOCKET DESKTOP_AUTOSTART_ID
+    exec regolith-session-x11
+fi
+
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     source /etc/os-release

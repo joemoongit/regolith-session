@@ -1,0 +1,155 @@
+#!/bin/sh
+# Additional Regolith X11 logins of a user who already has a session:
+#  1. With no session running, the launcher starts gnome-session as before.
+#  2. With a session running, the launcher must not start another
+#     gnome-session (one user manager and one session bus per user make
+#     that fail, and it would replace the first session's DISPLAY,
+#     XAUTHORITY and I3SOCK in the manager's environment). It starts
+#     regolith-session-x11 directly instead, on the new login's display,
+#     for any display and any number of times.
+#  3. Such a session starts its i3 without the first session's I3SOCK or
+#     SWAYSOCK, leaves the manager's environment untouched, and points
+#     wm.program.logout on its display at its own i3, so the logout
+#     keybinding ends only this session.
+#  4. A session without the additional marker still clears I3SOCK and
+#     SWAYSOCK from the manager's environment, as before.
+# gnome-session, regolith-session-x11 (for the launcher checks), i3 and
+# systemctl are stubbed; the real regolith-session-x11 runs under Xvfb
+# for the session checks.
+set -eu
+
+tmp=${AUTOPKGTEST_TMP:-$(mktemp -d)}
+fail=0
+say() { echo "$1"; }
+check() { # check <description> <0=pass>
+    if [ "$2" -eq 0 ]; then echo "ok: $1"; else echo "FAIL: $1"; fail=1; fi
+}
+
+export HOME="$tmp/home" XDG_RUNTIME_DIR="$tmp/xdg"
+mkdir -p "$HOME/.config/regolith3/flags" "$XDG_RUNTIME_DIR" "$tmp/bin"
+chmod 700 "$XDG_RUNTIME_DIR"
+
+printf 'DISPLAY=:0\nXAUTHORITY=/tmp/first-Xauthority\nI3SOCK=/tmp/first-i3.sock\n' \
+    > "$tmp/manager.env"
+cp "$tmp/manager.env" "$tmp/manager.env.expected"
+
+cat > "$tmp/bin/systemctl" <<EOF
+#!/bin/sh
+echo "systemctl \$*" >> "$tmp/systemctl.log"
+[ "\${1-}" = "--user" ] && shift
+cmd=\${1-}
+[ \$# -gt 0 ] && shift
+case \$cmd in
+    is-active)
+        if [ -f "$tmp/session-active" ]; then echo active; exit 0; fi
+        echo inactive; exit 3 ;;
+    unset-environment)
+        for v in "\$@"; do
+            grep -v "^\$v=" "$tmp/manager.env" > "$tmp/manager.env.tmp" || true
+            mv "$tmp/manager.env.tmp" "$tmp/manager.env"
+        done ;;
+    show-environment) cat "$tmp/manager.env" ;;
+esac
+exit 0
+EOF
+cat > "$tmp/bin/gnome-session" <<EOF
+#!/bin/sh
+echo "gnome-session \$* marker=\${REGOLITH_X11_ADDITIONAL_SESSION-(unset)}" >> "$tmp/gnome-session.log"
+EOF
+cat > "$tmp/bin/regolith-session-x11" <<EOF
+#!/bin/sh
+echo "session DISPLAY=\${DISPLAY-(unset)} marker=\${REGOLITH_X11_ADDITIONAL_SESSION-(unset)}" >> "$tmp/additional.log"
+EOF
+cat > "$tmp/bin/i3" <<EOF
+#!/bin/sh
+env > "$tmp/i3.env"
+xrdb -query > "$tmp/i3.xrdb" 2>/dev/null || true
+EOF
+for stub in systemctl gnome-session regolith-session-x11 i3; do
+    chmod +x "$tmp/bin/$stub"
+done
+: > "$tmp/systemctl.log"; : > "$tmp/gnome-session.log"; : > "$tmp/additional.log"
+
+launcher() { # launcher <display>
+    env PATH="$tmp/bin:$PATH" DISPLAY="$1" XDG_SESSION_TYPE=x11 \
+        /usr/bin/regolith-session-x11-launch >"$tmp/launcher.log" 2>&1
+}
+
+# 1. No session running: gnome-session, as before.
+rm -f "$tmp/session-active"
+launcher :0
+grep -q 'gnome-session --session=regolith-x11' "$tmp/gnome-session.log"
+check "no session: launcher starts gnome-session" $?
+[ ! -s "$tmp/additional.log" ]
+check "no session: no additional session is started" $?
+
+# 2. A session is running: additional sessions on their own displays,
+#    as many as there are logins.
+touch "$tmp/session-active"
+for display in :1 :2 :17; do
+    launcher "$display"
+done
+[ "$(wc -l < "$tmp/gnome-session.log")" -eq 1 ]
+check "session running: gnome-session is not started again" $?
+for display in :1 :2 :17; do
+    grep -qx "session DISPLAY=$display marker=1" "$tmp/additional.log"
+    check "session running: additional session on $display" $?
+done
+
+# The session script itself, under Xvfb.
+Xvfb -displayfd 3 -screen 0 1280x800x24 -nolisten tcp -noreset \
+    3>"$tmp/display" >"$tmp/xvfb.log" 2>&1 &
+xvfb=$!
+trap 'kill $xvfb 2>/dev/null || true' EXIT
+for _ in 1 2 3 4 5 6 7 8 9 10; do [ -s "$tmp/display" ] && break; sleep 0.5; done
+display=$(cat "$tmp/display")
+
+run_real_session() { # run_real_session <additional|normal>
+    : > "$tmp/systemctl.log"
+    rm -f "$tmp/i3.env" "$tmp/i3.xrdb"
+    # A login gets a fresh X server; give this run the same fresh start.
+    DISPLAY=":$display" xrdb -remove 2>/dev/null || true
+    cp "$tmp/manager.env.expected" "$tmp/manager.env"
+    stale=$XDG_RUNTIME_DIR/sway-ipc.1000.4242.sock
+    if [ "$1" = additional ]; then
+        env -u NOTIFY_SOCKET PATH="$tmp/bin:$PATH" \
+            REGOLITH_X11_ADDITIONAL_SESSION=1 \
+            I3SOCK="$stale" SWAYSOCK="$stale" \
+            XDG_SESSION_TYPE=x11 DISPLAY=":$display" \
+            timeout 60 dbus-run-session -- /usr/bin/regolith-session-x11 \
+            >"$tmp/$1.log" 2>&1 || { cat "$tmp/$1.log"; return 1; }
+    else
+        env -u REGOLITH_X11_ADDITIONAL_SESSION \
+            NOTIFY_SOCKET="$tmp/notify" PATH="$tmp/bin:$PATH" \
+            I3SOCK="$stale" SWAYSOCK="$stale" \
+            XDG_SESSION_TYPE=x11 DISPLAY=":$display" \
+            timeout 60 dbus-run-session -- /usr/bin/regolith-session-x11 \
+            >"$tmp/$1.log" 2>&1 || { cat "$tmp/$1.log"; return 1; }
+    fi
+}
+
+# 3. Additional session.
+run_real_session additional
+check "additional session runs" $?
+if [ -f "$tmp/i3.env" ]; then
+    ! grep -q '^I3SOCK=' "$tmp/i3.env" && ! grep -q '^SWAYSOCK=' "$tmp/i3.env"
+    check "additional session: i3 starts without the first session's sockets" $?
+else
+    check "additional session: i3 ran" 1
+fi
+cmp -s "$tmp/manager.env" "$tmp/manager.env.expected"
+check "additional session: manager environment still points at the first session" $?
+! grep -q 'unset-environment' "$tmp/systemctl.log"
+check "additional session: manager environment is not cleared" $?
+grep -q '^wm.program.logout:.*i3-msg exit' "$tmp/i3.xrdb"
+check "additional session: logout on this display exits only this i3" $?
+
+# 4. Ordinary session: stale sockets are still cleared from the manager.
+run_real_session normal
+check "ordinary session runs" $?
+grep -q 'unset-environment I3SOCK SWAYSOCK\|unset-environment .*I3SOCK' "$tmp/systemctl.log"
+check "ordinary session: stale I3SOCK/SWAYSOCK are cleared from the manager" $?
+! grep -q '^wm.program.logout:.*i3-msg exit' "$tmp/i3.xrdb"
+check "ordinary session: logout is not redirected" $?
+
+exit $fail

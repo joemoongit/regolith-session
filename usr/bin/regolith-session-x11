@@ -14,9 +14,25 @@ gdm3_xrdb_fixup() {
         load_system_xres
     fi
 }
+# A session started directly, not through the launcher and not as the
+# systemd service, while another session of this user is already running
+# is an additional session too. A service start (NOTIFY_SOCKET set) is the
+# already running session itself, so it is never reclassified here.
+if [ -z "${REGOLITH_X11_ADDITIONAL_SESSION-}" ] && [ -z "${NOTIFY_SOCKET-}" ] \
+   && regolith_x11_session_active; then
+    export REGOLITH_X11_ADDITIONAL_SESSION=1
+fi
+
 # Check if NOTIFY_SOCKET is available. This is used as a
 # test to see if the session uses systemd
-if [ -z "${NOTIFY_SOCKET-}" ]; then
+if [ -n "${REGOLITH_X11_ADDITIONAL_SESSION-}" ]; then
+  # Additional session (see regolith-session-x11-launch): no gnome-session
+  # and no systemd service owns this session, so do not register with the
+  # first session's gnome-session. Still take the environment.d variables,
+  # which no manager imports for this process.
+  unset NOTIFY_SOCKET DESKTOP_AUTOSTART_ID
+  import_environment_d
+elif [ -z "${NOTIFY_SOCKET-}" ]; then
   # Register with gnome-session so that it does not kill the whole session thinking it is dead.
   # When gnome-session respawns us after i3 crashed, the client is still
   # registered and this fails with AlreadyRegistered; i3 must start anyway.
@@ -34,6 +50,16 @@ clear_wm_sockets    # SWAYSOCK and I3SOCK of an earlier session
 
 gdm3_xrdb_fixup     # Remove when https://bugs.launchpad.net/ubuntu/+source/gdm3/+bug/1955850 is fixed
 load_i3_resources   # ~/.Xresources, ~/.config/regolith3/Xresources and the look, as 'regolith-look refresh' does
+
+if [ -n "${REGOLITH_X11_ADDITIONAL_SESSION-}" ]; then
+    # On this display only: point the logout keybinding at this session's
+    # i3. The i3 configuration reads wm.program.logout from the X resources
+    # of its own display (default: gnome-session-quit, which would talk to
+    # the first session's gnome-session on the shared user bus and log that
+    # session out). i3-msg finds this i3 through this display's IPC socket,
+    # so Super+Shift+E exits only this i3, and with it only this session.
+    printf '%s\n' 'wm.program.logout: i3-msg exit' | xrdb -nocpp -merge
+fi
 
 UPDATE_FLAG_DIR="$HOME/.config/regolith3/flags"
 if [ ! -e "$UPDATE_FLAG_DIR" ]; then

@@ -65,9 +65,48 @@ import_environment_d() {
 # them. i3 takes I3SOCK as the path for its own IPC socket, so it would listen
 # on the dead sway socket's path, and a stale SWAYSOCK makes tools believe
 # they run under sway. The window managers set the variables they need.
+# In an additional X11 session another session of this user is still using
+# the user manager, and its I3SOCK is recorded there: only drop the variables
+# locally there, and leave the manager's environment for that session.
 clear_wm_sockets() {
     unset I3SOCK SWAYSOCK
+    if [ -n "${REGOLITH_X11_ADDITIONAL_SESSION-}" ]; then
+        return 0
+    fi
     systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
+}
+
+# regolith_x11_session_active: true when this user already has a Regolith
+# X11 session. The systemd user manager is one per user, so that session is
+# the gnome-session one, with regolith-x11.service running in it. A running
+# i3 of this user on another display is taken as the same sign where the
+# manager cannot be asked (its i3 is what an additional session would add).
+regolith_x11_session_active() {
+    local unit state pid environ_file proc_display
+    if command -v systemctl >/dev/null 2>&1; then
+        for unit in regolith-x11.service regolith-x11.target \
+                    gnome-session@regolith-x11.target \
+                    gnome-session-manager@regolith-x11.service; do
+            state=$(systemctl --user is-active "$unit" 2>/dev/null) || true
+            case $state in
+                active|activating|reloading) return 0 ;;
+            esac
+        done
+    fi
+    if command -v pgrep >/dev/null 2>&1; then
+        for pid in $(pgrep -u "$(id -u)" -x i3 2>/dev/null) ; do
+            proc_display=
+            environ_file="/proc/$pid/environ"
+            if [ -r "$environ_file" ]; then
+                proc_display=$(tr '\0' '\n' < "$environ_file" 2>/dev/null \
+                               | sed -n 's/^DISPLAY=//p' | head -n 1) || true
+            fi
+            if [ -z "$proc_display" ] || [ "$proc_display" != "${DISPLAY-}" ]; then
+                return 0
+            fi
+        done
+    fi
+    return 1
 }
 
 # Determine where the default i3 and sway config files are
