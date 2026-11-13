@@ -16,6 +16,56 @@ case ":${XDG_CONFIG_DIRS-}:" in
     *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-$SESSION_TYPE:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
 esac
 
+# True when this user already has a graphical session running through
+# gnome-session/systemd. The systemd user manager is per user, so a second
+# gnome-session would contend for its singleton units and its DISPLAY,
+# XAUTHORITY and I3SOCK; that login must become an extra session instead.
+# Per-user and unbounded: any user can hold any number of extra sessions.
+regolith_x11_primary_running() {
+    local _regolith_uid
+    if command -v systemctl >/dev/null 2>&1; then
+        if systemctl --user is-active --quiet regolith-x11.service 2>/dev/null; then
+            return 0
+        fi
+        if systemctl --user is-active --quiet "gnome-session@${SESSION_TYPE}.target" 2>/dev/null; then
+            return 0
+        fi
+        # Any other graphical gnome-session (Wayland, another desktop) also
+        # owns the user manager's display environment.
+        if systemctl --user is-active --quiet gnome-session.target 2>/dev/null; then
+            return 0
+        fi
+    fi
+    _regolith_uid=$(id -u 2>/dev/null || echo "")
+    if [ -n "${_regolith_uid-}" ]; then
+        if command -v pgrep >/dev/null 2>&1; then
+            # Exact binaries only: gnome-session-quit and friends must not match.
+            if pgrep -u "$_regolith_uid" -f '(^|/)gnome-session( |$)' >/dev/null 2>&1; then
+                return 0
+            fi
+            if pgrep -u "$_regolith_uid" -f '(^|/)gnome-session-service( |$)' >/dev/null 2>&1; then
+                return 0
+            fi
+        elif command -v ps >/dev/null 2>&1; then
+            if ps -u "$_regolith_uid" -o args= 2>/dev/null | grep -E '(^|/)[g]nome-session( |$)' >/dev/null 2>&1; then
+                return 0
+            fi
+            if ps -u "$_regolith_uid" -o args= 2>/dev/null | grep -E '(^|/)[g]nome-session-service( |$)' >/dev/null 2>&1; then
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
+if regolith_x11_primary_running; then
+    # Extra session on this login's own display: run i3 directly without
+    # gnome-session and without touching the systemd user manager, so the
+    # primary session keeps running with its environment intact.
+    export REGOLITH_X11_EXTRA_SESSION=1
+    exec regolith-session-x11
+fi
+
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     source /etc/os-release

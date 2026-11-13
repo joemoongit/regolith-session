@@ -67,7 +67,43 @@ import_environment_d() {
 # they run under sway. The window managers set the variables they need.
 clear_wm_sockets() {
     unset I3SOCK SWAYSOCK
+    # Extra X11 sessions run alongside the primary one: its I3SOCK in the user
+    # manager still points at the primary's i3, so leave the manager alone and
+    # only clear this login's own environment. i3 then creates its own socket.
+    if [ -n "${REGOLITH_X11_EXTRA_SESSION-}" ]; then
+        return 0
+    fi
     systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
+}
+
+# Shadow "systemctl --user" for extra X11 sessions so they never touch the
+# systemd user manager, whose DISPLAY, XAUTHORITY and I3SOCK belong to the
+# primary session. i3's config runs "systemctl --user start regolith-x11.target"
+# when NOTIFY_SOCKET is empty; here that must succeed without doing anything,
+# so i3 does not fall through to systemd-notify. System operations still run.
+setup_extra_systemctl_stub() {
+    local real_systemctl stub_dir
+    case "${PATH-}" in
+        *regolith-x11-extra-*) return 0 ;;
+    esac
+    real_systemctl=$(command -v systemctl 2>/dev/null || echo /bin/systemctl)
+    stub_dir=$(mktemp -d "${TMPDIR:-/tmp}/regolith-x11-extra-XXXXXXXX" 2>/dev/null \
+        || mktemp -d "/tmp/regolith-x11-extra-XXXXXXXX" 2>/dev/null) || return 0
+    {
+        printf '#!/bin/sh\n'
+        printf 'for _regolith_arg in "$@" ; do\n'
+        printf '    case "$_regolith_arg" in\n'
+        printf '        --user) exit 0 ;;\n'
+        printf '    esac\n'
+        printf 'done\n'
+        printf 'exec "%s" "$@"\n' "$real_systemctl"
+    } > "$stub_dir/systemctl"
+    chmod +x "$stub_dir/systemctl"
+    export PATH="$stub_dir:$PATH"
+    # The stub must stay for the whole session, since i3's children inherit
+    # this PATH; remove it when the session leader ends.
+    # shellcheck disable=SC2064 # the directory is per-session, expand now
+    trap "rm -rf \"$stub_dir\"" EXIT || true
 }
 
 # Determine where the default i3 and sway config files are
@@ -257,7 +293,11 @@ load_i3_resources() {
     load_standard_xres # ~/.Xresources
     load_regolith_xres # ~/.config/regolith3/Xresources and the look
     xres_i3_cleanup    # Single-quote workspace names for i3
-    apply_user_xft_dpi # Xft.dpi from the files above, through gsd-xsettings
+    # Extra sessions have no gsd-xsettings of their own; the shared
+    # text-scaling-factor belongs to the primary session, so leave it alone.
+    if [ -z "${REGOLITH_X11_EXTRA_SESSION-}" ]; then
+        apply_user_xft_dpi # Xft.dpi from the files above, through gsd-xsettings
+    fi
 }
 
 # Load the trawl resources as the login does

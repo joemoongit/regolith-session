@@ -5,6 +5,11 @@ set -Eeu -o pipefail
 
 source /usr/lib/regolith/regolith-session-common.sh
 
+# Extra sessions (REGOLITH_X11_EXTRA_SESSION=1) run alongside the primary
+# Regolith X11 session on their own display, without gnome-session and without
+# touching the systemd user manager. See regolith-session-x11-launch.
+EXTRA_SESSION="${REGOLITH_X11_EXTRA_SESSION-}"
+
 gdm3_xrdb_fixup() {
     if xrescat testkey defaultval > /dev/null 2>&1; then
         echo "xrdb appears to be property initialized, skipping xrdb init"
@@ -20,7 +25,9 @@ if [ -z "${NOTIFY_SOCKET-}" ]; then
   # Register with gnome-session so that it does not kill the whole session thinking it is dead.
   # When gnome-session respawns us after i3 crashed, the client is still
   # registered and this fails with AlreadyRegistered; i3 must start anyway.
-  if [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
+  # Extra sessions have no gnome-session of their own; registering with the
+  # primary's SessionManager on the shared bus would tie the two together.
+  if [ -z "$EXTRA_SESSION" ] && [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
       dbus-send --print-reply --session --dest=org.gnome.SessionManager "/org/gnome/SessionManager" org.gnome.SessionManager.RegisterClient "string:Regolith-X11" "string:$DESKTOP_AUTOSTART_ID" \
           || echo "Could not register with gnome-session, continuing"
   fi
@@ -32,8 +39,23 @@ fi
 # --------- Script Main -----------
 clear_wm_sockets    # SWAYSOCK and I3SOCK of an earlier session
 
+# Extra sessions must never touch the systemd user manager afterwards either:
+# i3's config runs "systemctl --user start regolith-x11.target" when
+# NOTIFY_SOCKET is empty. Shadow it before i3 starts.
+if [ -n "$EXTRA_SESSION" ]; then
+    setup_extra_systemctl_stub
+fi
+
 gdm3_xrdb_fixup     # Remove when https://bugs.launchpad.net/ubuntu/+source/gdm3/+bug/1955850 is fixed
 load_i3_resources   # ~/.Xresources, ~/.config/regolith3/Xresources and the look, as 'regolith-look refresh' does
+
+if [ -n "$EXTRA_SESSION" ]; then
+    # No gnome-session here to log out through: Super+Shift+E must exit just
+    # this session's i3. The resource is per-display, so the primary keeps its
+    # gnome-session-quit logout.
+    printf '%s\n' 'wm.program.logout: i3-msg exit' | xrdb -merge 2>/dev/null \
+        || echo "Could not override logout for extra session, continuing"
+fi
 
 UPDATE_FLAG_DIR="$HOME/.config/regolith3/flags"
 if [ ! -e "$UPDATE_FLAG_DIR" ]; then
@@ -58,7 +80,7 @@ i3 -c "$I3_CONFIG_FILE"
 # Run the user's post-logout script. In a systemd-managed session,
 # regolith-post-logout.service runs it when the session ends: logging out
 # stops this script together with the window manager, so it would never get
-# here. Without systemd (gnome-session --builtin) it runs here.
+# here. Without systemd (gnome-session --builtin, extra sessions) it runs here.
 if [ -z "${NOTIFY_SOCKET-}" ] && [ -f "$USER_POST_LOGOUT_SCRIPT_FILE" ] ; then
     echo "Regolith is launching user post-logout file $USER_POST_LOGOUT_SCRIPT_FILE"
 	timeout --verbose 5 bash "$USER_POST_LOGOUT_SCRIPT_FILE"
