@@ -10,5 +10,12 @@ here=$(dirname "$0")
 mkdir -p /usr/local/lib/systemd/user
 printf '[Service]\nExecStart=-/usr/libexec/comp-unit --flag %%h\n' \
     > /usr/local/lib/systemd/user/comp-unit.service
-trap 'rm -f /usr/local/lib/systemd/user/comp-unit.service' EXIT
+# ... and a service that only the session's systemd target pulls in, as
+# regolith-session-flashback's drop-in does for the GNOME Flashback polkit agent
+printf '[Service]\nExecStart=/usr/libexec/target-svc\n' > /usr/local/lib/systemd/user/target-svc.service
+mkdir -p /usr/local/lib/systemd/user/gnome-session@testde.target.d
+printf '[Unit]\nWants=org.example.Some.target\nWants=target-svc.service comp-unit.service\nRequires=testde-wm.service\n' \
+    > /usr/local/lib/systemd/user/gnome-session@testde.target.d/session.conf
+trap 'rm -rf /usr/local/lib/systemd/user/comp-unit.service /usr/local/lib/systemd/user/target-svc.service \
+    /usr/local/lib/systemd/user/gnome-session@testde.target.d' EXIT
 "$here/multisession-as-user" "$here/multisession.bash"
