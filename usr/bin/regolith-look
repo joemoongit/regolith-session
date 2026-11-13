@@ -45,6 +45,9 @@ refresh() {
         swaymsg -t send_tick '{"status": "reload_pending"}'
     else
         reload_i3_resources
+        # The rebuild clears this display's resources: keep a
+        # concurrent session's logout pointed at its own i3.
+        apply_concurrent_session_logout
     fi
 
     # Determine if Look loader script is available

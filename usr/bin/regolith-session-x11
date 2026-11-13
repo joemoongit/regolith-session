@@ -14,13 +14,27 @@ gdm3_xrdb_fixup() {
         load_system_xres
     fi
 }
+# A concurrent session (started directly by regolith-session-x11-launch
+# because a session of this user is already running) is not run by
+# systemd or gnome-session.  The launcher marks it; also recognise it
+# when run without the mark, as an already active regolith-x11.service
+# then belongs to the other session.  The service itself (the ordinary
+# first session) has NOTIFY_SOCKET set and is never "concurrent".
+if [ -z "${REGOLITH_X11_CONCURRENT_SESSION-}" ] && [ -z "${NOTIFY_SOCKET-}" ] \
+    && command -v systemctl >/dev/null 2>&1 \
+    && [ "$(systemctl --user is-active regolith-x11.service 2>/dev/null || true)" = "active" ]; then
+    export REGOLITH_X11_CONCURRENT_SESSION=1
+fi
+
 # Check if NOTIFY_SOCKET is available. This is used as a
 # test to see if the session uses systemd
 if [ -z "${NOTIFY_SOCKET-}" ]; then
   # Register with gnome-session so that it does not kill the whole session thinking it is dead.
   # When gnome-session respawns us after i3 crashed, the client is still
   # registered and this fails with AlreadyRegistered; i3 must start anyway.
-  if [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
+  # A concurrent session has no gnome-session of its own: registering
+  # would attach it to the first session's session manager.
+  if [ -z "${REGOLITH_X11_CONCURRENT_SESSION-}" ] && [ -n "${DESKTOP_AUTOSTART_ID-}" ]; then
       dbus-send --print-reply --session --dest=org.gnome.SessionManager "/org/gnome/SessionManager" org.gnome.SessionManager.RegisterClient "string:Regolith-X11" "string:$DESKTOP_AUTOSTART_ID" \
           || echo "Could not register with gnome-session, continuing"
   fi
@@ -52,6 +66,8 @@ if [ ! -e "$UPDATE_FLAG_DIR" ]; then
 fi
 
 resolve_default_config_file
+# On this display only: its logout shortcut must end only this session.
+apply_concurrent_session_logout
 echo "Regolith is launching i3 with $I3_CONFIG_FILE"
 i3 -c "$I3_CONFIG_FILE"
 

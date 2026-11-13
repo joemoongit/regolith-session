@@ -16,6 +16,282 @@ case ":${XDG_CONFIG_DIRS-}:" in
     *) export XDG_CONFIG_DIRS="/etc/xdg/xdg-$SESSION_TYPE:${XDG_CONFIG_DIRS:-/etc/xdg}" ;;
 esac
 
+# --- Concurrent X11 sessions ---------------------------------------------
+# gnome-session (through the per-user systemd manager and the per-user
+# session bus) can run only once for a user: a second gnome-session leader
+# finds its session units already active, uploads the new DISPLAY /
+# XAUTHORITY over the first session's in the user manager and then exits
+# ("Session manager is already running!"), so LightDM shows the greeter
+# again.  A login that finds a Regolith X11 session of this user already
+# running therefore starts i3 directly (regolith-session-x11) on its own
+# display instead of through gnome-session.  That path registers nothing
+# with the user manager, leaves its DISPLAY / XAUTHORITY / I3SOCK (and the
+# first session) alone, and ends with its own i3.  The registry and the
+# checks below are per user (the runtime directory and the user manager
+# are per user), so different users never block each other, and entries
+# are keyed by PID, so there is no fixed limit on concurrent sessions.
+
+SESSION_REGISTRY_DIR=""
+if [ -n "${XDG_RUNTIME_DIR-}" ]; then
+    SESSION_REGISTRY_DIR="$XDG_RUNTIME_DIR/regolith-x11-sessions"
+elif [ -d "/run/user/$(id -u)" ]; then
+    SESSION_REGISTRY_DIR="/run/user/$(id -u)/regolith-x11-sessions"
+fi
+
+SESSION_LOCK_HELD=0
+
+acquire_session_lock() {
+    [ -n "$SESSION_REGISTRY_DIR" ] || return 0
+    command -v flock >/dev/null 2>&1 || return 0
+    mkdir -p "$SESSION_REGISTRY_DIR" 2>/dev/null || return 0
+    exec 9>"$SESSION_REGISTRY_DIR/.lock" || return 0
+    flock 9 2>/dev/null || return 0
+    SESSION_LOCK_HELD=1
+}
+
+release_session_lock() {
+    if [ "$SESSION_LOCK_HELD" = "1" ]; then
+        flock -u 9 2>/dev/null || true
+        exec 9>&-
+        SESSION_LOCK_HELD=0
+    fi
+}
+
+registry_pid_is_session() { # registry_pid_is_session <pid>
+    local pid=$1 cmdline
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    if [ -r "/proc/$pid/cmdline" ]; then
+        cmdline=$(tr '\0' ' ' <"/proc/$pid/cmdline" 2>/dev/null || true)
+        case "$cmdline" in
+            *gnome-session*|*regolith-session-x11*|*i3*) ;;
+            *) return 1 ;;
+        esac
+    fi
+    return 0
+}
+
+DETECTED_SESSION_DISPLAY=""
+DETECTED_SESSION_XAUTHORITY=""
+
+registered_session_running() {
+    [ -n "$SESSION_REGISTRY_DIR" ] && [ -d "$SESSION_REGISTRY_DIR" ] || return 1
+    local entry pid
+    for entry in "$SESSION_REGISTRY_DIR"/*; do
+        [ -f "$entry" ] || continue
+        pid=${entry##*/}
+        case $pid in
+            ''|*[!0-9]*|"$$") continue ;;
+        esac
+        if registry_pid_is_session "$pid"; then
+            DETECTED_SESSION_DISPLAY=$(cat "$entry" 2>/dev/null || true)
+            return 0
+        fi
+        if ! kill -0 "$pid" 2>/dev/null; then
+            rm -f "$entry" 2>/dev/null || true
+        fi
+    done
+    return 1
+}
+
+# registered_session_display_running <display>: a live registered session
+# is using this display, so an environment recorded for it is still live.
+registered_session_display_running() { # <display>
+    [ -n "$1" ] || return 1
+    [ -n "$SESSION_REGISTRY_DIR" ] && [ -d "$SESSION_REGISTRY_DIR" ] || return 1
+    local entry pid
+    for entry in "$SESSION_REGISTRY_DIR"/*; do
+        [ -f "$entry" ] || continue
+        pid=${entry##*/}
+        case $pid in
+            ''|*[!0-9]*|"$$") continue ;;
+        esac
+        if registry_pid_is_session "$pid" && [ "$(cat "$entry" 2>/dev/null || true)" = "$1" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+systemd_session_running() {
+    command -v systemctl >/dev/null 2>&1 || return 1
+    local unit out
+    for unit in regolith-x11.service \
+                "gnome-session-x11@$SESSION_TYPE.target" \
+                "gnome-session@$SESSION_TYPE.target" \
+                "gnome-session-manager@$SESSION_TYPE.service"; do
+        out=$(systemctl --user is-active "$unit" 2>/dev/null || true)
+        if [ "$out" = "active" ]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
+is_ancestor_pid() { # is_ancestor_pid <pid>
+    local check=$1 cur=$$ ppid
+    while [ "$cur" -gt 1 ] 2>/dev/null; do
+        [ "$cur" = "$check" ] && return 0
+        ppid=$(ps -o ppid= -p "$cur" 2>/dev/null | tr -d ' ')
+        [ -n "$ppid" ] || return 1
+        cur=$ppid
+    done
+    return 1
+}
+
+process_session_running() {
+    command -v pgrep >/dev/null 2>&1 || return 1
+    local pid proc_display
+    for pid in $(pgrep -u "$(id -u)" -x i3 2>/dev/null || true) \
+               $(pgrep -u "$(id -u)" -x gnome-session 2>/dev/null || true) \
+               $(pgrep -u "$(id -u)" -f '(^|/)regolith-session-x11($| )' 2>/dev/null || true); do
+        [ "$pid" = "$$" ] && continue
+        is_ancestor_pid "$pid" && continue
+        # A process on this very display is not another session (for
+        # example a launcher run by hand inside the session); a session
+        # on another display, or one whose display cannot be read, is.
+        proc_display=""
+        if [ -r "/proc/$pid/environ" ]; then
+            proc_display=$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null \
+                           | sed -n 's/^DISPLAY=//p' | head -n 1)
+            DETECTED_SESSION_XAUTHORITY=$(tr '\0' '\n' <"/proc/$pid/environ" 2>/dev/null \
+                           | sed -n 's/^XAUTHORITY=//p' | head -n 1)
+        fi
+        if [ -n "$proc_display" ] && [ "$proc_display" = "${DISPLAY-}" ]; then
+            continue
+        fi
+        DETECTED_SESSION_DISPLAY=$proc_display
+        return 0
+    done
+    return 1
+}
+
+existing_session_running() {
+    registered_session_running || systemd_session_running || process_session_running
+}
+
+register_session() {
+    [ -n "$SESSION_REGISTRY_DIR" ] || return 0
+    mkdir -p "$SESSION_REGISTRY_DIR" 2>/dev/null || return 0
+    printf '%s\n' "${DISPLAY-}" >"$SESSION_REGISTRY_DIR/$$" 2>/dev/null || true
+}
+
+write_primary_environment() { # write_primary_environment <display> <xauthority> <i3sock>
+    [ -n "$SESSION_REGISTRY_DIR" ] || return 0
+    mkdir -p "$SESSION_REGISTRY_DIR" 2>/dev/null || return 0
+    local tmp="$SESSION_REGISTRY_DIR/.primary.env.$$"
+    {
+        [ -n "$1" ] && printf 'DISPLAY=%s\n' "$1"
+        [ -n "$2" ] && printf 'XAUTHORITY=%s\n' "$2"
+        [ -n "$3" ] && printf 'I3SOCK=%s\n' "$3"
+        true
+    } >"$tmp" 2>/dev/null || return 0
+    mv -f "$tmp" "$SESSION_REGISTRY_DIR/primary.env" 2>/dev/null || true
+}
+
+record_primary_environment() {
+    write_primary_environment "${DISPLAY-}" "${XAUTHORITY-}" ""
+}
+
+read_env_file() { # read_env_file <file>: sets STORED_DISPLAY etc.
+    STORED_DISPLAY="" STORED_XAUTHORITY="" STORED_I3SOCK=""
+    [ -n "$SESSION_REGISTRY_DIR" ] && [ -f "$SESSION_REGISTRY_DIR/primary.env" ] || return 0
+    local key value
+    while IFS='=' read -r key value; do
+        case $key in
+            DISPLAY) STORED_DISPLAY=$value ;;
+            XAUTHORITY) STORED_XAUTHORITY=$value ;;
+            I3SOCK) STORED_I3SOCK=$value ;;
+        esac
+    done <"$SESSION_REGISTRY_DIR/primary.env"
+}
+
+read_manager_environment() { # sets MANAGER_DISPLAY etc.
+    MANAGER_DISPLAY="" MANAGER_XAUTHORITY="" MANAGER_I3SOCK=""
+    command -v systemctl >/dev/null 2>&1 || return 0
+    local out key value
+    out=$(systemctl --user show-environment 2>/dev/null || true)
+    [ -n "$out" ] || return 0
+    while IFS='=' read -r key value; do
+        case $key in
+            DISPLAY) MANAGER_DISPLAY=$value ;;
+            XAUTHORITY) MANAGER_XAUTHORITY=$value ;;
+            I3SOCK) MANAGER_I3SOCK=$value ;;
+        esac
+    done <<<"$out"
+}
+
+# Put the first session's values back in the user manager if (and only if)
+# something on the way into this login -- for example the Xsession
+# activation upload that runs before this launcher -- already replaced
+# them with this login's.  When nothing replaced them this is a no-op and
+# the manager is not touched at all.
+preserve_primary_environment() {
+    local stored_display stored_xauthority stored_i3sock
+    read_env_file
+    stored_display=$STORED_DISPLAY stored_xauthority=$STORED_XAUTHORITY stored_i3sock=$STORED_I3SOCK
+    # A recorded primary that is no longer running is stale: do not
+    # resurrect its display for a manager that has moved on.
+    if [ -n "$stored_display" ] \
+        && ! systemd_session_running \
+        && ! registered_session_display_running "$stored_display"; then
+        stored_display="" stored_xauthority="" stored_i3sock=""
+    fi
+    read_manager_environment
+    local keep_display=$stored_display keep_xauthority=$stored_xauthority keep_i3sock=$stored_i3sock
+    if [ -z "$keep_display" ] && [ -n "$DETECTED_SESSION_DISPLAY" ]; then
+        keep_display=$DETECTED_SESSION_DISPLAY
+    fi
+    if [ -z "$keep_xauthority" ] && [ -n "$DETECTED_SESSION_XAUTHORITY" ]; then
+        keep_xauthority=$DETECTED_SESSION_XAUTHORITY
+    fi
+    if [ -z "$keep_display" ] && [ -n "$MANAGER_DISPLAY" ] && [ "$MANAGER_DISPLAY" != "${DISPLAY-}" ]; then
+        keep_display=$MANAGER_DISPLAY
+    fi
+    if [ -z "$keep_xauthority" ] && [ -n "$MANAGER_XAUTHORITY" ] && [ "$MANAGER_XAUTHORITY" != "${XAUTHORITY-}" ]; then
+        keep_xauthority=$MANAGER_XAUTHORITY
+    fi
+    if [ -z "$keep_i3sock" ] && [ -n "$MANAGER_I3SOCK" ]; then
+        keep_i3sock=$MANAGER_I3SOCK
+    fi
+    # Remember the first session's values for later concurrent logins,
+    # which may arrive after they were replaced in the manager.
+    if [ -n "$keep_display" ] || [ -n "$keep_xauthority" ] || [ -n "$keep_i3sock" ]; then
+        write_primary_environment "$keep_display" "$keep_xauthority" "$keep_i3sock"
+    fi
+    local -a restore=()
+    if [ -n "$keep_display" ] && [ "$MANAGER_DISPLAY" != "$keep_display" ]; then
+        restore+=("DISPLAY=$keep_display")
+    fi
+    if [ -n "$keep_xauthority" ] && [ "$MANAGER_XAUTHORITY" != "$keep_xauthority" ]; then
+        restore+=("XAUTHORITY=$keep_xauthority")
+    fi
+    if [ -n "$keep_i3sock" ] && [ "$MANAGER_I3SOCK" != "$keep_i3sock" ]; then
+        restore+=("I3SOCK=$keep_i3sock")
+    fi
+    if [ "${#restore[@]}" -gt 0 ]; then
+        systemctl --user set-environment "${restore[@]}" 2>/dev/null || true
+        if command -v dbus-update-activation-environment >/dev/null 2>&1; then
+            dbus-update-activation-environment "${restore[@]}" 2>/dev/null || true
+        fi
+    fi
+}
+
+acquire_session_lock
+if [ -n "${DISPLAY-}" ] && existing_session_running; then
+    preserve_primary_environment
+    register_session
+    release_session_lock
+    export REGOLITH_X11_CONCURRENT_SESSION=1
+    # This session is not the systemd / gnome-session one: do not let it
+    # register with, or be tied to, the first session's session manager.
+    unset NOTIFY_SOCKET DESKTOP_AUTOSTART_ID
+    exec regolith-session-x11
+fi
+register_session
+record_primary_environment
+release_session_lock
+
 if [ -f /etc/os-release ]; then
     # shellcheck disable=SC1091
     source /etc/os-release

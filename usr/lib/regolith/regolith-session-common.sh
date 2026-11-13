@@ -67,7 +67,30 @@ import_environment_d() {
 # they run under sway. The window managers set the variables they need.
 clear_wm_sockets() {
     unset I3SOCK SWAYSOCK
+    # A concurrent X11 session (REGOLITH_X11_CONCURRENT_SESSION set by
+    # regolith-session-x11-launch) shares the per-user systemd manager
+    # with the first session: removing I3SOCK / SWAYSOCK there would
+    # delete the first session's values.  Only the local environment is
+    # cleared then, so this session's window manager still starts
+    # without the earlier session's sockets.
+    if [ -n "${REGOLITH_X11_CONCURRENT_SESSION-}" ]; then
+        return 0
+    fi
     systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
+}
+
+# Point the logout binding of a concurrent X11 session at its own i3.
+# The binding reads wm.program.logout from this display's X resources
+# (its default, gnome-session-quit, would talk to the first session's
+# session manager on the shared session bus and end that session), so
+# replace it on this display only: i3-msg contacts the i3 of this
+# display and exits only it, which ends only this session.  A no-op in
+# an ordinary session, and re-applied after a look refresh rebuilds
+# this display's resources (see regolith-look).
+apply_concurrent_session_logout() {
+    [ -n "${REGOLITH_X11_CONCURRENT_SESSION-}" ] || return 0
+    command -v xrdb >/dev/null 2>&1 || return 0
+    printf '%s\n' 'wm.program.logout: i3-msg exit' | xrdb -nocpp -merge 2>/dev/null || true
 }
 
 # Determine where the default i3 and sway config files are
