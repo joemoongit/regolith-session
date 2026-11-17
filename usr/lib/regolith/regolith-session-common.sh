@@ -67,7 +67,10 @@ import_environment_d() {
 # they run under sway. The window managers set the variables they need.
 clear_wm_sockets() {
     unset I3SOCK SWAYSOCK
-    systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
+    # A secondary session (see regolith-session-x11-launch) leaves the systemd
+    # user environment to the first session
+    [ -n "${REGOLITH_SESSION_SECONDARY-}" ] \
+        || systemctl --user unset-environment I3SOCK SWAYSOCK 2>/dev/null || :
 }
 
 # Determine where the default i3 and sway config files are
@@ -257,7 +260,11 @@ load_i3_resources() {
     load_standard_xres # ~/.Xresources
     load_regolith_xres # ~/.config/regolith3/Xresources and the look
     xres_i3_cleanup    # Single-quote workspace names for i3
-    apply_user_xft_dpi # Xft.dpi from the files above, through gsd-xsettings
+    # Xft.dpi from the files above, through gsd-xsettings. A secondary session
+    # (see regolith-session-x11-launch) runs neither gsd-xsettings nor GNOME
+    # Flashback, so it would compute the scaling factor for a UI scale of 1 and
+    # could change it for the first session.
+    [ -n "${REGOLITH_SESSION_SECONDARY-}" ] || apply_user_xft_dpi
 }
 
 # Load the trawl resources as the login does
