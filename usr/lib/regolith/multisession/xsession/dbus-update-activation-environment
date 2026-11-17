@@ -1,0 +1,7 @@
+#!/bin/sh
+# regolith-multisession: first on PATH while /etc/X11/Xsession prepares a
+# standalone login (19regolith-multisession). The login's DISPLAY and the rest
+# must not reach the user's systemd manager or the user bus, which the user's
+# first session owns; the session's own bus gets them later.
+logger -t regolith-multisession -- "standalone login: kept 'dbus-update-activation-environment $*' away from the user manager" 2>/dev/null || :
+exit 0

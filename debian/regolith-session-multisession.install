@@ -1,5 +1,5 @@
 usr/bin/regolith-multisession
 usr/lib/regolith/multisession
 etc/regolith/multisession
-etc/X11/Xsession.d/94regolith-multisession
+etc/X11/Xsession.d/19regolith-multisession
 usr/share/xsessions/regolith-x11-multisession.desktop

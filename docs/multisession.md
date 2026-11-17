@@ -7,15 +7,17 @@ compositor.
 
 ```
 VT7   joe   LightDM greeter                  primary     stock gnome-session + systemd
-VT8   ana   LightDM greeter                  primary     ana's own user manager
-VT3   joe   regolith-multisession start      standalone  own bus, own components
-VT4   joe   regolith-multisession start      standalone  ...
+VT8   joe   LightDM greeter                  standalone  own bus, own components
+VT9   ana   LightDM greeter                  primary     ana's own user manager
+VT10  joe   LightDM greeter                  standalone  ...
+VT3   joe   regolith-multisession start      standalone  from a text console
 ```
 
-Other users log in at the LightDM greeter. A user who already has a session
-starts more from a text console with `regolith-multisession start`: logging
-in at the greeter again as the same user only switches back to the running
-session (LightDM does that for every user who has a session on the seat).
+Every session can come from the LightDM greeter: pick **Regolith / X11
+(multi-session)** each time. For the same user's second and later logins,
+LightDM has to support `X-LightDM-Allow-Multiple-Sessions` (see
+[LightDM](#lightdm)); without it, a user who already has a session starts
+more from a text console with `regolith-multisession start`.
 
 ## Why the second login failed
 
@@ -26,11 +28,11 @@ There are two separate problems.
    you restart it from tty2, it kills the X server under your first
    session, then shows a fresh greeter. To get another login, ask the
    running LightDM for another greeter (`regolith-multisession new`, or
-   `dm-tool switch-to-greeter`). It opens one on the next free VT. That
-   greeter is for other users, though: when a user who has a session on the
-   seat logs in there, LightDM returns to that session ("Returning to
-   existing user session" in `/var/log/lightdm/lightdm.log`) and runs no
-   second one.
+   `dm-tool switch-to-greeter`). It opens one on the next free VT. But when
+   a user who has a session on the seat logs in there, LightDM returns to
+   that session ("Returning to existing user session" in
+   `/var/log/lightdm/lightdm.log`) and runs no second one, whatever session
+   they pick.
 
 2. **gnome-session runs only one graphical session per user.** The
    Regolith X11 entry runs `regolith-session-x11-launch`, which runs
@@ -63,7 +65,9 @@ display manager use it.
 The package adds **"Regolith / X11 (multi-session)"** to the greeter
 (`/usr/share/xsessions/regolith-x11-multisession.desktop`). Its `Exec` is
 `regolith-multisession launch regolith-x11`, which picks a mode for each
-login. `regolith-multisession start`, run on a text console, starts the same
+login. The entry has `X-LightDM-Allow-Multiple-Sessions=true`, so a LightDM
+that supports the key starts it again for a user who is logged in.
+`regolith-multisession start`, run on a text console, starts the same
 `launch` on that VT with `startx`, always standalone:
 
 | Mode | When | What runs |
@@ -107,10 +111,12 @@ A standalone session runs like this:
   - `pgrep` / `pkill` / `pidof`: for per-display programs (picom by
     default), only this display's process is seen. A compositor restart
     therefore no longer kills other sessions' compositors.
-- **An Xsession.d hook** (`94regolith-multisession`) hides the user bus
-  address from `95dbus_update-activation-env`, which would otherwise push
-  the standalone session's `DISPLAY` into the user manager before
-  regolith-multisession runs.
+- **An Xsession.d hook** (`19regolith-multisession`) decides the mode
+  before `20dbus_xdg-runtime` and `95dbus_update-activation-env` run. Both
+  call `dbus-update-activation-environment --systemd`, which would push the
+  standalone login's `DISPLAY` into the user manager and the user bus. For a
+  standalone login the hook puts a `dbus-update-activation-environment` that
+  does nothing first on `PATH`; `launch` takes it off again.
 - **Teardown.** Everything runs in the session's own process group, so when
   the session ends, everything it started ends too. Processes that left the
   group (i3 runs its `exec` children in sessions of their own) are found by
@@ -136,12 +142,12 @@ the choice for each user. `regolith-multisession start` needs `startx`
 
 | Command | What it does |
 |---|---|
-| `regolith-multisession new` | Open one more greeter on the next free VT, for another user. Works from a text console (Ctrl+Alt+F2) or from inside a session. |
-| `regolith-multisession start [session]` | On a text console (Ctrl+Alt+F3, log in): start another session of this user on that VT. The session is standalone; logging out returns to the console. |
+| `regolith-multisession new` | Open one more greeter on the next free VT. Works from a text console (Ctrl+Alt+F2) or from inside a session. Log in there with **Regolith / X11 (multi-session)**. |
+| `regolith-multisession start [session]` | On a text console (Ctrl+Alt+F3, log in): start another session of this user on that VT, for a LightDM without `X-LightDM-Allow-Multiple-Sessions`. The session is standalone; logging out returns to the console. |
 | `regolith-multisession status` | List every graphical session and its mode (`regolith-x11 standalone #2`). |
 | `regolith-multisession doctor` | Check the installation, this user's sessions, and recent log lines. |
 
-Switch between sessions with Ctrl+Alt+F3, F7, F8 and so on. To open a
+Switch between sessions with Ctrl+Alt+F7, F8, F9 and so on. To open a
 greeter with a key, add a user i3 partial:
 
 ```
@@ -178,12 +184,29 @@ Everything is data in `/etc/regolith/multisession`. Per-user overrides go in
   `MULTISESSION_INSTANCE` and `MULTISESSION_RUNDIR`. For example, a hook can
   give later sessions a different look; see `hooks.d/README`.
 
+## LightDM
+
+Unpatched LightDM runs one session per user and seat: a greeter login of a
+user who has a session switches back to it, whichever session was picked.
+A session entry with
+
+```
+X-LightDM-Allow-Multiple-Sessions=true
+```
+
+changes that for that session only: LightDM starts it even if the user has a
+session, and leaves the running one locked. Picking any other session (the
+stock **Regolith / X11**) still returns to the running session. The key is
+proposed upstream in LightDM; `regolith-multisession new` tells whether the
+installed LightDM supports it. Until it does, use `regolith-multisession
+start` from a text console for the same user's further sessions (logind
+lists those as `tty` sessions).
+
 ## Limitations
 
-- **One LightDM session per user.** LightDM returns a second login of a
-  user to their running session, so further sessions of the same user come
-  from `regolith-multisession start` on a text console. logind lists those
-  as `tty` sessions.
+- **The stock entry returns to the first session.** With several sessions of
+  a user, a greeter login with the stock **Regolith / X11** entry returns to
+  the first one LightDM finds.
 - **Screen lock follows the user's LightDM session.** GNOME Flashback's
   screensaver binds to the user's last `x11` logind session, not its own
   (`gf_find_systemd_session`). Locking or unlocking one of the user's
@@ -229,8 +252,7 @@ themselves:
   the running session's `DISPLAY`.
 - gnome-flashback (GNOME): find the screensaver's logind session with
   `sd_pid_get_session()` first, so each session locks only itself.
-- LightDM: an option to start a new session for a user who has one, so the
-  greeter can offer what `start` does.
+- LightDM: `X-LightDM-Allow-Multiple-Sessions` (see [LightDM](#lightdm)).
 
 ## Tests
 

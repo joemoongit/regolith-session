@@ -32,7 +32,7 @@ export MULTISESSION_SYSCONF=$T/etc
 export XDG_DATA_DIRS=$T/share:/usr/local/share:/usr/share XDG_CONFIG_DIRS=$T/xdg:/etc/xdg
 MS=/usr/bin/regolith-multisession
 LIB=/usr/lib/regolith/multisession
-HOOK=/etc/X11/Xsession.d/94regolith-multisession
+HOOK=/etc/X11/Xsession.d/19regolith-multisession
 
 expect "msagent check" "$LIB/msagent" check
 
@@ -66,6 +66,7 @@ valid_entry() { ! desktop-file-validate "$1" 2>&1 | grep -v '"DesktopNames"' | g
 expect "the regolith-x11 entry is installed" test -r "$shipped"
 expect "it is a valid desktop entry" valid_entry "$shipped"
 expect "it runs the launcher for regolith-x11" test "$(key "$shipped" Exec)" = "$MS launch regolith-x11"
+expect "it lets LightDM start it again for a logged-in user" test "$(key "$shipped" X-LightDM-Allow-Multiple-Sessions)" = true
 for k in DesktopNames TryExec Type; do
     expect "it has the stock entry's $k" test "$(key "$shipped" $k)" = "$(key "$stock" $k)"
 done
@@ -77,6 +78,7 @@ expect "entry: names carry the suffix" grep -qx "Name=Test DE (multi-session)" "
 expect "entry: localized names too" grep -qx "Name\[de\]=Test-DE (multi-session)" "$gen"
 expect "entry: keeps DesktopNames" grep -qx "DesktopNames=TestDE;GNOME-Flashback" "$gen"
 expect "entry: keeps TryExec" grep -qx "TryExec=/bin/true" "$gen"
+expect "entry: lets LightDM start it again for a logged-in user" test "$(grep -c '^X-LightDM-Allow-Multiple-Sessions=true$' "$gen")" -eq 1
 expect "entry: valid desktop entry" valid_entry "$gen"
 expect "entry: a missing session is an error" bash -c "! '$MS' entry missing-session 2>/dev/null"
 expect "entry: not of a multi-session entry" bash -c "! '$MS' entry testde-multisession 2>/dev/null"
@@ -128,19 +130,28 @@ reset_logind; fake_session self "$me" x11 active
 decide standalone "graphical-session.target active without a session" FAKE_GST=active
 decide standalone "decision handed down by the Xsession hook" MULTISESSION_ISOLATE=1
 decide primary "Xsession hook decided primary" MULTISESSION_ISOLATE=0 FAKE_GST=active
-hook() { # [env...] → what the Xsession hook leaves for the later Xsession.d scripts
+# What the later Xsession.d scripts (20dbus_xdg-runtime, 95dbus_update-activation-env)
+# do after the hook: they call dbus-update-activation-environment --systemd by
+# name. The fake one in $D/bin records that the user manager was updated.
+printf '#!/bin/sh\necho "$*" >>"%s/duae"\n' "$D" >"$D/bin/dbus-update-activation-environment"
+chmod +x "$D/bin/dbus-update-activation-environment"
+hook() { # [env...] → "<MULTISESSION_ISOLATE> <updated|untouched>"
+    rm -f "$D/duae"
     # shellcheck disable=SC2016  # expanded by the inner sh
     env PATH="$D/bin:$PATH" FAKE_LOGIND="$D/logind" MULTISESSION_SYSCONF="$D/etc" XDG_SESSION_ID=self \
-        DBUS_SESSION_BUS_ADDRESS=unix:path=/userbus "$@" \
-        HOOK=$HOOK sh -c '. "$HOOK"; echo "${MULTISESSION_ISOLATE:-none} ${DBUS_SESSION_BUS_ADDRESS:-unset}"'
+        DBUS_SESSION_BUS_ADDRESS=unix:path=/userbus "$@" HOOK=$HOOK sh -ec '
+            . "$HOOK"
+            dbus-update-activation-environment --systemd DISPLAY XAUTHORITY
+            echo "${MULTISESSION_ISOLATE:-none} $([ -s "'"$D"'/duae" ] && echo updated || echo untouched)"'
 }
-expect "Xsession hook: primary login keeps the user bus" \
-    test "$(hook DESKTOP_SESSION=testde-multisession)" = "0 unix:path=/userbus"
+expect "Xsession hook: runs before 20dbus_xdg-runtime" test "${HOOK##*/}" \< 20dbus_xdg-runtime
+expect "Xsession hook: primary login updates the user manager as usual" \
+    test "$(hook DESKTOP_SESSION=testde-multisession)" = "0 updated"
 fake_session c9 "$me" x11 active
-expect "Xsession hook: standalone login hides the user bus from 95dbus_update-activation-env" \
-    test "$(hook DESKTOP_SESSION=testde-multisession)" = "1 unset"
+expect "Xsession hook: standalone login leaves the user manager alone" \
+    test "$(hook DESKTOP_SESSION=testde-multisession)" = "1 untouched"
 expect "Xsession hook: other sessions are left alone" \
-    test "$(hook DESKTOP_SESSION=regolith-x11)" = "none unix:path=/userbus"
+    test "$(hook DESKTOP_SESSION=regolith-x11)" = "none updated"
 reset_logind; fake_session self "$me" x11 active
 echo "ISOLATE=always" >"$D/etc/multisession.conf"; decide standalone "ISOLATE=always"
 echo "ISOLATE=never" >"$D/etc/multisession.conf"; fake_session c8 "$me" x11 active; decide primary "ISOLATE=never"
@@ -249,7 +260,7 @@ EOF
     # What LightDM and the Xsession hook hand to the session
     env DISPLAY=":$n" XDG_SESSION_ID="t$n" MULTISESSION_INSTANCE_TAG="$n" \
         DESKTOP_SESSION=testde-multisession XDG_CONFIG_DIRS="/etc/xdg/xdg-testde-multisession:$XDG_CONFIG_DIRS" \
-        DBUS_SESSION_BUS_ADDRESS="$USER_BUS" \
+        DBUS_SESSION_BUS_ADDRESS="$USER_BUS" PATH="$LIB/xsession:$PATH" \
         setsid "$MS" launch testde >"$T/launch$n.log" 2>&1 &
     echo $! >"$T/launch$n.pid"
 }
@@ -263,6 +274,7 @@ for n in 1 2; do
     expect "session $n: own private bus" bash -c "grep -q '^bus=' $T/s$n.env && ! grep -qF 'bus=$USER_BUS' $T/s$n.env"
     expect "session $n: standalone mode" grep -qx "mode=standalone" "$T/s$n.env"
     expect "session $n: shims first on PATH" grep -q "^path=$LIB/shims:" "$T/s$n.env"
+    expect "session $n: the Xsession hook's no-op is off PATH" bash -c "! grep -qF '$LIB/xsession' $T/s$n.env"
     expect "session $n: session name restored for the session" grep -qx "desktop_session=testde" "$T/s$n.env"
     expect "session $n: XDG dirs use the session's own name" grep -q "^xdg_config_dirs=/etc/xdg/xdg-testde:" "$T/s$n.env"
     expect "session $n: profile setup ran" grep -qx "gdsid=this-is-deprecated" "$T/s$n.env"

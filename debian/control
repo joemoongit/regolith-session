@@ -120,16 +120,16 @@ Depends: ${misc:Depends},
     util-linux
 Recommends: lightdm, xinit
 Description: Several Regolith X11 sessions at once, for one user or many
- This package adds "Regolith / X11 (multi-session)" to the login screen, and
- 'regolith-multisession start' to start more sessions of a user from a text
- console: on any number of VTs, as any number of users, and several times as
- the same user (LightDM itself returns a user's second login to their running
- session).
+ This package adds "Regolith / X11 (multi-session)" to the login screen: log
+ in with it on any number of VTs, as any number of users, and several times
+ as the same user. The same user's later logins at the greeter need a LightDM
+ that supports X-LightDM-Allow-Multiple-Sessions; otherwise
+ 'regolith-multisession start' starts them from a text console.
  .
  A user's first session is the stock Regolith session. gnome-session allows
  only one graphical session per user, so each later session of that user
  runs standalone: on its own D-Bus bus, with its own session components,
  per-user services such as dconf and the keyring shared with the first
  session, and no changes to the systemd user manager that the first session
- owns. 'regolith-multisession new' opens another LightDM greeter, for another
- user, from a text console or a running session.
+ owns. 'regolith-multisession new' opens another LightDM greeter from a text
+ console or a running session.

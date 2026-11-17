@@ -188,6 +188,12 @@ prepend_path_var() { # <var> <dir>
     esac
 }
 
+remove_path_var() { # <var> <dir>
+    local v=":${!1:-}:"
+    while [[ $v == *":$2:"* ]]; do v=${v/":$2:"/:}; done
+    v=${v#:}; export "$1=${v%:}"
+}
+
 run_hooks() {
     local dir hook
     for dir in "$MS_SYSCONF/hooks.d" "$(user_config_dir)/hooks.d"; do
@@ -199,6 +205,21 @@ run_hooks() {
             source "$hook" || log "hook $hook failed (ignored)"
             set -Eeu
         done
+    done
+}
+
+# This session's number among the user's live graphical sessions: the lowest
+# one that no other live session has, so numbers are reused after a logout
+next_instance() {
+    local id n unnumbered=0 used=" "
+    for id in $( { other_graphical_sessions; other_multisession_sessions; } | sort -u); do
+        n=$(sed -n 's/^instance=//p' "${XDG_RUNTIME_DIR:-/nonexistent}/multisession/$id/state" 2>/dev/null)
+        if [[ $n =~ ^[0-9]+$ ]]; then used+="$n "; else unnumbered=$((unnumbered + 1)); fi
+    done
+    for ((n = 1; ; n++)); do
+        [[ $used == *" $n "* ]] && continue
+        if ((unnumbered > 0)); then unnumbered=$((unnumbered - 1)); continue; fi
+        printf '%s\n' "$n"; return 0
     done
 }
 
@@ -276,16 +297,26 @@ cmd_new() {
     seat=${seat##*/}
     log "asking LightDM for a new greeter on $seat"
     XDG_SEAT_PATH=/org/freedesktop/DisplayManager/$seat dm-tool switch-to-greeter
-    if [[ -n $(other_graphical_sessions) || ${XDG_SESSION_TYPE:-} == x11 ]]; then
+    if [[ -n $(other_graphical_sessions) || ${XDG_SESSION_TYPE:-} == x11 ]] && ! lightdm_allows_multiple_sessions; then
         echo "regolith-multisession: logging in as $MS_USER at the new greeter returns to $MS_USER's" \
-            "running session (LightDM does that for a user who has one). For another session" \
+            "running session (this LightDM does that for a user who has one). For another session" \
             "of $MS_USER, log in on a text console (Ctrl+Alt+F3) and run: regolith-multisession start" >&2
     fi
 }
 
+# Whether LightDM starts a new session for a user who has one when the chosen
+# session's entry has X-LightDM-Allow-Multiple-Sessions=true. Older LightDM
+# switches back to the running session instead.
+lightdm_allows_multiple_sessions() {
+    local bin
+    bin=$(command -v lightdm 2>/dev/null) || bin=/usr/sbin/lightdm
+    [[ -r $bin ]] && LC_ALL=C grep -qa 'X-LightDM-Allow-Multiple-Sessions' "$bin"
+}
+
 # regolith-multisession start [<session>]: from a text console, start another
-# session of this user on this VT. LightDM can't: logging in at its greeter
-# as a user who has a session on the seat switches back to that session.
+# session of this user on this VT. For LightDM without
+# X-LightDM-Allow-Multiple-Sessions: logging in at its greeter as a user who
+# has a session on the seat switches back to that session.
 cmd_start() {
     local name=${1:-regolith-x11} tty n
     command -v startx >/dev/null 2>&1 || die "startx not found (package xinit)"
@@ -304,7 +335,7 @@ cmd_start() {
 
 # regolith-multisession launch <session>: the Exec of a multi-session entry.
 cmd_launch() {
-    local name=${1:?usage: regolith-multisession launch <session>} desktop instances
+    local name=${1:?usage: regolith-multisession launch <session>} desktop
     load_config
     load_profile "$name"
     restore_session_identity "$name"
@@ -313,9 +344,12 @@ cmd_launch() {
 
     local mode=primary
     if should_isolate; then mode=standalone; fi
-    instances=$( { other_graphical_sessions; other_multisession_sessions; } | sort -u | wc -l)
+    # The Xsession hook's no-op dbus-update-activation-environment is done:
+    # from here on the session's own bus takes the updates
+    remove_path_var PATH "$MS_LIBDIR/xsession"
     export MULTISESSION_SESSION=$name MULTISESSION_MODE=$mode
-    export MULTISESSION_INSTANCE=$((instances + 1)) MULTISESSION_RUNDIR
+    export MULTISESSION_INSTANCE MULTISESSION_RUNDIR
+    MULTISESSION_INSTANCE=$(next_instance)
     MULTISESSION_RUNDIR=$(session_rundir)
     write_state
     run_hooks
@@ -458,10 +492,13 @@ cmd_entry() {
     src=$(find_desktop "$name" "${XSESSION_DIRS[@]}") || die "no session '$name' in ${XSESSION_DIRS[*]}"
     awk -v src="$src" -v suffix="$NAME_SUFFIX" -v exec_cmd="$MS_BIN launch $name" '
         BEGIN { print "# Made by regolith-multisession entry from " src }
-        /^\[/ { in_entry = ($0 == "[Desktop Entry]"); print; next }
+        function close_entry() { if (in_entry) print "X-LightDM-Allow-Multiple-Sessions=true"; in_entry = 0 }
+        /^\[/ { close_entry(); in_entry = ($0 == "[Desktop Entry]"); print; next }
         in_entry && /^Exec=/ { print "Exec=" exec_cmd; next }
         in_entry && /^Name(\[[^]]*\])?=/ { print $0 suffix; next }
+        in_entry && /^X-LightDM-Allow-Multiple-Sessions=/ { next }
         { print }
+        END { close_entry() }
     ' "$src"
 }
 
@@ -525,7 +562,7 @@ cmd_doctor() {
     check "msagent works (python3 with PyGObject)" "$MS_AGENT" check
     check "user bus at $(user_bus_path) (bridges need it)" test -S "$(user_bus_path)"
     if [[ -d /etc/X11/Xsession.d ]]; then
-        check "Xsession.d hook installed" test -r /etc/X11/Xsession.d/94regolith-multisession
+        check "Xsession.d hook installed" test -r /etc/X11/Xsession.d/19regolith-multisession
     fi
     echo "This user ($MS_USER)"
     printf '  info  other graphical sessions: %s\n' "$(other_graphical_sessions | tr '\n' ' ')"

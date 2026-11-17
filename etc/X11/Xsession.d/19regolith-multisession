@@ -1,0 +1,21 @@
+# regolith-multisession: decide whether this login runs standalone before any
+# Xsession.d script hands its environment to the user's systemd manager or to
+# the user bus's activation environment (20dbus_xdg-runtime,
+# 95dbus_update-activation-env). Those belong to the user's first session: for
+# a standalone login, dbus-update-activation-environment does nothing until
+# 'regolith-multisession launch' runs the session on its own bus. Sourced by
+# /etc/X11/Xsession.
+case "${DESKTOP_SESSION:-}" in
+    *-multisession)
+        if [ -x /usr/bin/regolith-multisession ]; then
+            if /usr/bin/regolith-multisession should-isolate; then
+                MULTISESSION_ISOLATE=1
+                PATH=/usr/lib/regolith/multisession/xsession:$PATH
+                export PATH
+            else
+                MULTISESSION_ISOLATE=0
+            fi
+            export MULTISESSION_ISOLATE
+        fi
+        ;;
+esac
