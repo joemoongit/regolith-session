@@ -1,0 +1,227 @@
+#!/bin/bash
+# regolith-session-return <session>
+#
+# regolith-session-x11-launch runs this when the user's systemd manager
+# already has a graphical session, so gnome-session would refuse to start a
+# new one: gnome-session 48 and 49 refuse while
+# gnome-session-<type>@<session>.target is active, 50 while
+# graphical-session.target is. A display manager that knows the running
+# session returns to it instead, as LightDM does for the sessions it started.
+# One that doesn't know it, such as LightDM after "systemctl restart lightdm",
+# starts a new session, which ends at once and brings back the greeter on the
+# same VT: a login loop.
+#
+# - If the user has a graphical session on this seat, on another VT, whose
+#   display server is still running: point the user manager back at that
+#   session (this login's Xsession scripts pointed it at the new display),
+#   unlock the session and switch to it. Then wait until the user comes back
+#   to this VT, or that session ends, and exit 0: this login ends and the
+#   display manager shows a greeter here. Ending the login straight away would
+#   make LightDM switch to a new greeter, away from the session we returned
+#   to.
+# - If no graphical session of the user is running anywhere, the user manager
+#   kept one that is gone, for instance after the display manager was
+#   restarted while the user was still logged in on a text console. Shut it
+#   down as gnome-session does at logout and exit 1, so the login goes on.
+# - Otherwise, with a session this login can't switch to (another seat,
+#   remote, no VT), exit 1 and leave it be.
+set -Eeu -o pipefail
+
+proc=/proc
+cgroup_root=/sys/fs/cgroup
+poll_interval=1
+leave_timeout=10
+stop_timeout=30
+
+# The variables that identify a session in the user manager's environment,
+# restored from the session we return to.
+session_vars="DISPLAY|XAUTHORITY|WAYLAND_DISPLAY|XDG_SESSION_ID|XDG_VTNR|XDG_SEAT|\
+XDG_SESSION_TYPE|XDG_SESSION_CLASS|XDG_SESSION_DESKTOP|XDG_CURRENT_DESKTOP|\
+DESKTOP_SESSION|GDMSESSION"
+
+log() {
+    echo "regolith-session-return: $*" >&2
+}
+
+# session_props <id> prints the logind properties of a session as
+# "Key=value" lines.
+session_props() {
+    loginctl show-session "$1" -p Type -p Class -p State -p Seat -p VTNr \
+        -p Remote -p Desktop 2>/dev/null
+}
+
+session_prop() { # session_prop <id> <property>
+    loginctl show-session "$1" -p "$2" --value 2>/dev/null || true
+}
+
+# x_server_on_vt <vt>: is an X server running on VT <vt>?
+x_server_on_vt() {
+    pgrep -a -x 'Xorg|X' 2>/dev/null | grep -Eq "[[:space:]]vt0*$1([[:space:]]|\$)"
+}
+
+# classify_sessions sets $returnable to the user's other graphical sessions
+# that this login can switch to, best first, and $elsewhere to those it can't
+# switch to or can't tell are gone (another seat, remote, no VT). Sessions
+# that are gone are in neither: no longer active or online, one whose VT this
+# login now uses, or an X11 session whose X server has exited. That last
+# check needs to see the X servers' processes; if it can't even see this
+# login's own, X11 sessions count as running.
+classify_sessions() {
+    local own_seat own_vt own_desktop see_x=no id key value
+    local Type Class State Seat VTNr Remote Desktop
+    local matching="" others=""
+    returnable=""
+    elsewhere=""
+    own_seat=$(session_prop "$XDG_SESSION_ID" Seat)
+    own_vt=$(session_prop "$XDG_SESSION_ID" VTNr)
+    own_desktop=${XDG_SESSION_DESKTOP:-$(session_prop "$XDG_SESSION_ID" Desktop)}
+    if [ -n "$own_vt" ] && x_server_on_vt "$own_vt"; then
+        see_x=yes
+    fi
+
+    for id in $(loginctl show-user "$(id -u)" -p Sessions --value 2>/dev/null); do
+        [ "$id" = "$XDG_SESSION_ID" ] && continue
+        Type="" Class="" State="" Seat="" VTNr="" Remote="" Desktop=""
+        while IFS='=' read -r key value; do
+            case $key in
+                Type|Class|State|Seat|VTNr|Remote|Desktop) printf -v "$key" '%s' "$value" ;;
+            esac
+        done < <(session_props "$id")
+
+        case $Type in x11|wayland|mir) ;; *) continue ;; esac
+        [ "$Class" = user ] || continue
+        case $State in active|online) ;; *) continue ;; esac
+
+        if [ "$Remote" = yes ] || [ -z "$Seat" ] || [ "$Seat" != "$own_seat" ]; then
+            elsewhere="$elsewhere $id"
+            continue
+        fi
+        if [ -z "$VTNr" ] || [ "$VTNr" = 0 ]; then
+            elsewhere="$elsewhere $id"
+            continue
+        elif [ "$VTNr" = "$own_vt" ]; then
+            continue
+        elif [ "$Type" = x11 ] && [ "$see_x" = yes ] && ! x_server_on_vt "$VTNr"; then
+            continue
+        fi
+
+        if [ -n "$own_desktop" ] && [ "$Desktop" = "$own_desktop" ]; then
+            matching="$matching $id"
+        else
+            others="$others $id"
+        fi
+    done
+    returnable="${matching# }${others:+ }${others# }"
+    returnable=${returnable# }
+    elsewhere=${elsewhere# }
+}
+
+# session_environment <id> prints the session variables of a process of the
+# user in session <id>, one "NAME=value" per line, falling back to the
+# session's X display as logind knows it.
+session_environment() {
+    local id=$1 pid env procs
+    procs="$cgroup_root/user.slice/user-$(id -u).slice/session-$id.scope/cgroup.procs"
+    if [ -r "$procs" ]; then
+        while read -r pid; do
+            env=$(tr '\0' '\n' < "$proc/$pid/environ" 2>/dev/null) || continue
+            if grep -Eq '^(DISPLAY|WAYLAND_DISPLAY)=' <<< "$env"; then
+                grep -E "^($session_vars)=" <<< "$env" || true
+                return 0
+            fi
+        done < "$procs"
+    fi
+    local display
+    display=$(session_prop "$id" Display)
+    [ -z "$display" ] || echo "DISPLAY=$display"
+}
+
+restore_environment() { # restore_environment <id>
+    local vars=()
+    mapfile -t vars < <(session_environment "$1")
+    [ "${#vars[@]}" -gt 0 ] || return 0
+    if command -v dbus-update-activation-environment > /dev/null; then
+        dbus-update-activation-environment --systemd "${vars[@]}" || true
+    else
+        systemctl --user set-environment "${vars[@]}" || true
+    fi
+}
+
+# wait_until_back <id>: wait until the user comes back to this login's VT,
+# or session <id> ends.
+wait_until_back() {
+    local id=$1 waited=0
+    while [ "$(session_prop "$XDG_SESSION_ID" Active)" = yes ] && [ "$waited" -lt "$leave_timeout" ]; do
+        sleep "$poll_interval"
+        waited=$((waited + 1))
+    done
+    while [ "$(session_prop "$XDG_SESSION_ID" Active)" != yes ]; do
+        case $(session_prop "$id" State) in
+            active|online) ;;
+            *) log "session $id ended"; return 0 ;;
+        esac
+        sleep "$poll_interval"
+    done
+    log "back on this VT, ending this login"
+}
+
+return_to() { # return_to <id>
+    local id=$1
+    log "returning to the running session $id (VT $(session_prop "$id" VTNr)) of ${USER:-$(id -un)}"
+    restore_environment "$id"
+    loginctl unlock-session "$id" || true
+    if ! loginctl activate "$id"; then
+        log "could not switch to session $id"
+        return 1
+    fi
+    wait_until_back "$id"
+}
+
+# shut_down_stale <session>: end the graphical session the user manager kept
+# after it was gone, as gnome-session-ctl does at logout, and wait until
+# that's done, including the D-Bus restart it ends with, so the new session
+# doesn't lose its bus.
+shut_down_stale() {
+    local session=$1 ctl waited=0
+    local targets=(graphical-session.target "gnome-session-${XDG_SESSION_TYPE:-x11}@$session.target")
+    log "the user manager still runs a graphical session that has ended; shutting it down"
+    ctl=$(command -v gnome-session-ctl || echo /usr/libexec/gnome-session-ctl)
+    if [ -x "$ctl" ]; then
+        "$ctl" --shutdown || true
+    else
+        systemctl --user start --job-mode=replace-irreversibly gnome-session-shutdown.target || true
+    fi
+    while [ "$waited" -lt "$stop_timeout" ]; do
+        if ! systemctl --user is-active --quiet "${targets[@]}" gnome-session-shutdown.target &&
+           [ -z "$(systemctl --user list-jobs --no-legend 2>/dev/null)" ]; then
+            return 0
+        fi
+        sleep "$poll_interval"
+        waited=$((waited + 1))
+    done
+    log "the old session didn't finish shutting down in ${stop_timeout}s"
+}
+
+main() {
+    local session=${1:?usage: regolith-session-return <session>}
+    if [ -z "${XDG_SESSION_ID-}" ]; then
+        log "XDG_SESSION_ID is not set, can't look for a running session"
+        return 1
+    fi
+
+    classify_sessions
+    if [ -n "$returnable" ]; then
+        return_to "${returnable%% *}"
+        return
+    fi
+    if [ -n "$elsewhere" ]; then
+        log "${USER:-$(id -un)} has a graphical session on another seat, remote or without a VT ($elsewhere); gnome-session won't start a second one"
+        return 1
+    fi
+    shut_down_stale "$session"
+    return 1
+}
+
+if [ "${BASH_SOURCE[0]}" = "$0" ]; then
+    main "$@"
+fi

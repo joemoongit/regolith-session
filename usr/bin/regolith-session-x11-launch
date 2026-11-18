@@ -25,4 +25,18 @@ if [ -f /etc/os-release ]; then
     fi
 fi
 
+# gnome-session runs one graphical session per user: it refuses to start while
+# the user's systemd manager has one, and this login would end at once and
+# show the greeter again. LightDM returns to a running session instead of
+# starting another, but only to one it started itself, so not after
+# "systemctl restart lightdm". Switch back to the running session, or shut
+# down one the user manager kept after it was gone; see
+# regolith-session-return.
+if systemctl --user is-active --quiet graphical-session.target \
+        "gnome-session-${XDG_SESSION_TYPE:-x11}@$SESSION_TYPE.target" 2> /dev/null; then
+    if /usr/lib/regolith/regolith-session-return "$SESSION_TYPE"; then
+        exit 0
+    fi
+fi
+
 exec gnome-session --session=$SESSION_TYPE --disable-acceleration-check "$@"

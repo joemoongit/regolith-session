@@ -199,3 +199,7 @@ Tests: bar-blocks
 Depends: regolith-session-flashback,
          i3status-rs
 Restrictions: allow-stderr, skippable, skip-not-installable
+
+Tests: session-return
+Depends: regolith-session-flashback
+Restrictions: allow-stderr

@@ -1,0 +1,310 @@
+#!/bin/bash
+# A second login of a user whose systemd manager already runs a graphical
+# session: regolith-session-x11-launch hands it to regolith-session-return
+# instead of starting gnome-session, which would refuse and send the user
+# back to the greeter, over and over.
+#
+# Runs the launcher and regolith-session-return against fake loginctl,
+# systemctl, pgrep, gnome-session-ctl, gnome-session and sleep, which read and
+# write the logind and user manager state in a directory, and checks that:
+# - a session still running on another VT is unlocked and switched to, gets
+#   its environment back in the user manager, and the login ends once the
+#   user comes back to its VT, or that session ends;
+# - a session the user manager kept after it was gone is shut down and the
+#   login goes on to gnome-session;
+# - a session on another seat, a remote one, or one without a VT is left
+#   alone, and so is any X11 session when X servers can't be seen.
+# shellcheck disable=SC2030,SC2031,SC2317 # PATH set per run; check calls functions
+set -u
+
+LAUNCH=${LAUNCH:-/usr/bin/regolith-session-x11-launch}
+HELPER=${HELPER:-/usr/lib/regolith/regolith-session-return}
+
+fail=0
+pass() { echo "PASS: $*"; }
+failed() { echo "FAIL: $*"; fail=1; }
+check() { # check <description> <command>...
+    local what=$1
+    shift
+    if "$@"; then pass "$what"; else failed "$what"; fi
+}
+
+T=$(mktemp -d)
+trap 'rm -rf "$T"' EXIT
+UID_=$(id -u)
+
+mkdir -p "$T/bin"
+# loginctl: sessions are directories of property files under $T/logind.
+cat > "$T/bin/loginctl" <<'EOF'
+#!/bin/bash
+S=$STATE/logind
+echo "loginctl $*" >> "$STATE/log"
+cmd=$1; shift
+case $cmd in
+    show-user)
+        [ -d "$S" ] && ls "$S" | tr '\n' ' '; echo ;;
+    show-session)
+        id=$1; shift
+        [ -d "$S/$id" ] || exit 1
+        props=(); value=0
+        while [ $# -gt 0 ]; do
+            case $1 in -p) props+=("$2"); shift 2 ;; --value) value=1; shift ;; *) shift ;; esac
+        done
+        for p in "${props[@]}"; do
+            v=$(cat "$S/$id/$p" 2>/dev/null)
+            if [ $value = 1 ]; then echo "$v"; else echo "$p=$v"; fi
+        done ;;
+    unlock-session) ;;
+    activate)
+        [ -d "$S/$1" ] || exit 1
+        for d in "$S"/*; do echo no > "$d/Active"; done
+        echo yes > "$S/$1/Active" ;;
+esac
+EOF
+# systemctl --user: a unit is active while $T/units/<unit> exists.
+cat > "$T/bin/systemctl" <<'EOF'
+#!/bin/bash
+echo "systemctl $*" >> "$STATE/log"
+args=()
+for a in "$@"; do case $a in --user|--quiet|--no-legend|--job-mode=*) ;; *) args+=("$a") ;; esac; done
+case ${args[0]} in
+    is-active)
+        for u in "${args[@]:1}"; do [ -e "$STATE/units/$u" ] && exit 0; done
+        exit 3 ;;
+    list-jobs) cat "$STATE/jobs" 2>/dev/null ;;
+esac
+exit 0
+EOF
+cat > "$T/bin/pgrep" <<'EOF'
+#!/bin/bash
+cat "$STATE/xservers" 2>/dev/null
+EOF
+cat > "$T/bin/gnome-session-ctl" <<'EOF'
+#!/bin/bash
+echo "gnome-session-ctl $*" >> "$STATE/log"
+[ "$1" = --shutdown ] && rm -f "$STATE/units/"*
+EOF
+cat > "$T/bin/dbus-update-activation-environment" <<'EOF'
+#!/bin/bash
+echo "d-u-a-e $*" >> "$STATE/log"
+EOF
+cat > "$T/bin/gnome-session" <<'EOF'
+#!/bin/bash
+echo "gnome-session $*" >> "$STATE/log"
+EOF
+# sleep: the user comes back to this login's VT ($BACK_AFTER polls), or the
+# session returned to ends ($END_AFTER polls).
+cat > "$T/bin/sleep" <<'EOF'
+#!/bin/bash
+n=$(( $(cat "$STATE/sleeps" 2>/dev/null || echo 0) + 1 ))
+echo $n > "$STATE/sleeps"
+if [ -n "${BACK_AFTER-}" ] && [ "$n" -ge "$BACK_AFTER" ]; then
+    for d in "$STATE"/logind/*; do echo no > "$d/Active"; done
+    echo yes > "$STATE/logind/$XDG_SESSION_ID/Active"
+fi
+if [ -n "${END_AFTER-}" ] && [ "$n" -ge "$END_AFTER" ]; then
+    echo closing > "$STATE/logind/$END_SESSION/State"
+fi
+EOF
+chmod +x "$T/bin/"*
+
+# new_state: reset to this login, session c2 on seat0 VT 8, with the
+# user manager running a graphical session.
+new_state() {
+    export STATE="$T/state"
+    rm -rf "$STATE"
+    mkdir -p "$STATE/logind" "$STATE/units" "$STATE/fakeroot/proc" "$STATE/fakeroot/cgroup"
+    touch "$STATE/log" "$STATE/units/graphical-session.target" "$STATE/units/gnome-session-x11@regolith-x11.target"
+    add_session c2 x11 active seat0 8 no regolith-x11 yes
+    export XDG_SESSION_ID=c2 XDG_SESSION_TYPE=x11 XDG_SESSION_DESKTOP=regolith-x11
+    unset BACK_AFTER END_AFTER END_SESSION
+}
+
+# add_session <id> <type> <state> <seat> <vt> <remote> <desktop> [<active>]
+add_session() {
+    local d="$STATE/logind/$1"
+    mkdir -p "$d"
+    echo "$2" > "$d/Type"; echo user > "$d/Class"; echo "$3" > "$d/State"
+    echo "$4" > "$d/Seat"; echo "$5" > "$d/VTNr"; echo "$6" > "$d/Remote"
+    echo "$7" > "$d/Desktop"; echo "${8:-no}" > "$d/Active"; echo ":$(( $5 - 7 ))" > "$d/Display"
+}
+
+# add_process <session> <pid> <environment>...: a process of the user in a
+# session, with its environment.
+add_process() {
+    local id=$1 pid=$2
+    shift 2
+    local scope="$STATE/fakeroot/cgroup/user.slice/user-$UID_.slice/session-$id.scope"
+    mkdir -p "$scope" "$STATE/fakeroot/proc/$pid"
+    echo "$pid" >> "$scope/cgroup.procs"
+    printf '%s\0' "$@" > "$STATE/fakeroot/proc/$pid/environ"
+}
+
+x_server() { # x_server <vt>
+    echo "100$1 /usr/lib/xorg/Xorg :$(( $1 - 7 )) -seat seat0 -auth /var/run/lightdm/root/:0 -nolisten tcp vt$1 -novtswitch" >> "$STATE/xservers"
+}
+
+# run_helper: run regolith-session-return; sets $status.
+run_helper() {
+    (
+        export PATH="$T/bin:$PATH"
+        # shellcheck disable=SC1090
+        source "$HELPER"
+        # shellcheck disable=SC2034 # used by the helper's functions
+        proc="$STATE/fakeroot/proc"
+        # shellcheck disable=SC2034
+        cgroup_root="$STATE/fakeroot/cgroup"
+        main regolith-x11
+    ) > "$STATE/out" 2>&1
+    status=$?
+}
+
+logged() { grep -qF -- "$1" "$STATE/log"; }
+not_logged() { ! logged "$1"; }
+
+### A session still running on VT 7
+new_state
+add_session c1 x11 online seat0 7 no regolith-x11
+x_server 7; x_server 8
+add_process c1 1201 DISPLAY=:0 XAUTHORITY=/home/u/.Xauthority XDG_SESSION_ID=c1 XDG_VTNR=7 HOME=/home/u
+export BACK_AFTER=3
+run_helper
+check "running session: exits 0, so the login ends" [ "$status" = 0 ]
+check "running session: unlocks it" logged "loginctl unlock-session c1"
+check "running session: switches to it" logged "loginctl activate c1"
+check "running session: gives the user manager its environment back" \
+    logged "d-u-a-e --systemd DISPLAY=:0 XAUTHORITY=/home/u/.Xauthority XDG_SESSION_ID=c1 XDG_VTNR=7"
+check "running session: only the session variables" not_logged "HOME=/home/u"
+check "running session: waits until the user comes back to this VT" [ "$(cat "$STATE/sleeps")" = 3 ]
+check "running session: leaves the user manager's session alone" not_logged "gnome-session-ctl"
+
+### ... and that session ends while this login waits
+new_state
+add_session c1 x11 online seat0 7 no regolith-x11
+x_server 7; x_server 8
+export END_AFTER=2 END_SESSION=c1
+run_helper
+check "session ends while waiting: exits 0" [ "$status" = 0 ]
+check "session ends while waiting: stops waiting" [ "$(cat "$STATE/sleeps")" = 2 ]
+check "session ends while waiting: says so" grep -q "session c1 ended" "$STATE/out"
+
+### No readable process: DISPLAY from logind
+new_state
+add_session c1 x11 online seat0 7 no regolith-x11
+x_server 7; x_server 8
+export BACK_AFTER=1
+run_helper
+check "no readable process: DISPLAY from logind" logged "d-u-a-e --systemd DISPLAY=:0"
+
+### Two running sessions: the one with this login's desktop first
+new_state
+add_session c1 x11 online seat0 7 no other-desktop
+add_session c3 x11 online seat0 9 no regolith-x11
+x_server 7; x_server 8; x_server 9
+export BACK_AFTER=1
+run_helper
+check "two sessions: picks the one with this login's desktop" logged "loginctl activate c3"
+
+### Gone: its X server exited (display manager restarted)
+new_state
+add_session c1 x11 online seat0 7 no regolith-x11
+x_server 8
+run_helper
+check "X server gone: exits 1, so the login goes on" [ "$status" = 1 ]
+check "X server gone: doesn't switch" not_logged "loginctl activate"
+check "X server gone: shuts down the old session" logged "gnome-session-ctl --shutdown"
+check "X server gone: waits for the shutdown" logged "systemctl --user list-jobs"
+
+### Gone: its VT is this login's now
+new_state
+add_session c1 x11 active seat0 8 no regolith-x11
+x_server 8
+run_helper
+check "VT reused: exits 1" [ "$status" = 1 ]
+check "VT reused: doesn't switch" not_logged "loginctl activate"
+check "VT reused: shuts down the old session" logged "gnome-session-ctl --shutdown"
+
+### Gone: logind has no other session (closing ones don't count)
+new_state
+add_session c1 x11 closing seat0 7 no regolith-x11
+x_server 7; x_server 8
+run_helper
+check "no other session: exits 1" [ "$status" = 1 ]
+check "no other session: shuts down the old session" logged "gnome-session-ctl --shutdown"
+
+### Text and remote sessions
+new_state
+add_session c1 tty active seat0 2 no ""
+add_session c3 x11 active "" 0 yes regolith-x11
+run_helper
+check "remote session: exits 1" [ "$status" = 1 ]
+check "remote session: left alone" not_logged "gnome-session-ctl"
+check "remote session: doesn't switch" not_logged "loginctl activate"
+check "remote session: says why" grep -q "another seat, remote or without a VT (c3)" "$STATE/out"
+
+### Another seat
+new_state
+add_session c1 x11 active seat1 7 no regolith-x11
+x_server 7; x_server 8
+run_helper
+check "another seat: exits 1" [ "$status" = 1 ]
+check "another seat: left alone" not_logged "gnome-session-ctl"
+
+### A seat without VTs
+new_state
+add_session c1 x11 active seat0 0 no regolith-x11
+x_server 8
+run_helper
+check "no VT: exits 1" [ "$status" = 1 ]
+check "no VT: left alone" not_logged "gnome-session-ctl"
+check "no VT: doesn't switch" not_logged "loginctl activate"
+
+### X servers hidden (/proc mounted with hidepid): X11 sessions count as running
+new_state
+add_session c1 x11 online seat0 7 no regolith-x11
+export BACK_AFTER=1
+run_helper
+check "X servers hidden: doesn't shut down the session" not_logged "gnome-session-ctl"
+check "X servers hidden: switches to it" logged "loginctl activate c1"
+
+### No logind session
+new_state
+unset XDG_SESSION_ID
+run_helper
+check "no XDG_SESSION_ID: exits 1" [ "$status" = 1 ]
+check "no XDG_SESSION_ID: touches nothing" not_logged "gnome-session-ctl"
+
+### The launcher
+if [ -x "$HELPER" ] && [ "$HELPER" = /usr/lib/regolith/regolith-session-return ]; then
+    run_launch() {
+        ( export PATH="$T/bin:$PATH"; "$LAUNCH" ) > "$STATE/out" 2>&1
+        status=$?
+    }
+
+    new_state
+    rm -f "$STATE/units/"*
+    run_launch
+    check "launcher, first session: starts gnome-session" logged "gnome-session --session=regolith-x11"
+    check "launcher, first session: no return" not_logged "gnome-session-ctl"
+
+    new_state
+    add_session c1 x11 online seat0 7 no regolith-x11
+    x_server 7; x_server 8
+    export BACK_AFTER=1
+    run_launch
+    check "launcher, running session: switches to it" logged "loginctl activate c1"
+    check "launcher, running session: doesn't start gnome-session" not_logged "gnome-session --session"
+    check "launcher, running session: exits 0" [ "$status" = 0 ]
+
+    new_state
+    rm -f "$STATE/units/graphical-session.target"
+    add_session c1 x11 online seat0 7 no regolith-x11
+    x_server 8
+    run_launch
+    check "launcher, gone session (49's target): shuts it down" logged "gnome-session-ctl --shutdown"
+    check "launcher, gone session: then starts gnome-session" logged "gnome-session --session=regolith-x11"
+else
+    echo "SKIP: launcher checks need the installed package"
+fi
+
+exit $fail
