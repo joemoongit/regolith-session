@@ -3,6 +3,21 @@ set -Eeu -o pipefail
 
 SESSION_TYPE="regolith-x11"
 
+# /etc/X11/Xsession.d/19regolith-session-x11 puts a
+# dbus-update-activation-environment that does nothing first in PATH if
+# another Regolith X11 session runs; take it out again
+xsession_bin=/usr/lib/regolith/xsession
+held_environment=
+case ":$PATH:" in
+    *":$xsession_bin:"*)
+        PATH=":$PATH:"
+        PATH=${PATH//":$xsession_bin:"/:}
+        PATH=${PATH#:}
+        export PATH=${PATH%:}
+        held_environment=1
+        ;;
+esac
+
 if [ -z "${XDG_CURRENT_DESKTOP-}" ]; then
     export XDG_CURRENT_DESKTOP="Regolith:GNOME-Flashback:GNOME"
 fi
@@ -51,6 +66,16 @@ if regolith_session_target_active; then
         echo "Could not stop the earlier session, starting a secondary session" >&2
         start_secondary_session
     fi
+fi
+
+# If the other session ended meanwhile, hand this login's environment to the
+# user's systemd instance and D-Bus session bus as the Xsession.d scripts
+# would have
+if [ -n "$held_environment" ]; then
+    (
+        unset XDG_SEAT XDG_SEAT_PATH XDG_SESSION_ID XDG_SESSION_PATH XDG_VTNR
+        dbus-update-activation-environment --systemd --all
+    )
 fi
 
 exec gnome-session --session=$SESSION_TYPE --disable-acceleration-check "$@"

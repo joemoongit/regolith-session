@@ -1,0 +1,19 @@
+# Sourced by /etc/X11/Xsession.
+#
+# A login to Regolith X11 of a user whose systemd instance already runs a
+# Regolith X11 session gets a session of its own (see
+# regolith-session-x11-launch). The Xsession.d scripts that follow
+# (20dbus_xdg-runtime, 90qt-a11y, 95dbus_update-activation-env) would put
+# this login's environment, DISPLAY among it, into the systemd instance and
+# the activation environment of the user's D-Bus session bus, where the
+# running session's services would pick it up. Put a
+# dbus-update-activation-environment that does nothing first in PATH;
+# regolith-session-x11-launch removes it again.
+if [ "${DESKTOP_SESSION-}" = regolith-x11 ] &&
+   [ -r /usr/lib/regolith/regolith-session-x11-state.sh ]; then
+    . /usr/lib/regolith/regolith-session-x11-state.sh
+    if regolith_session_target_active && regolith_session_leader_running; then
+        PATH=/usr/lib/regolith/xsession:$PATH
+        export PATH
+    fi
+fi

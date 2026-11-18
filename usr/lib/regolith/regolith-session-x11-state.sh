@@ -1,5 +1,6 @@
 # Functions telling whether the user's systemd instance already runs a
-# Regolith X11 session. POSIX sh, sourced by regolith-session-x11-launch.
+# Regolith X11 session. POSIX sh, sourced by regolith-session-x11-launch and
+# /etc/X11/Xsession.d/19regolith-session-x11.
 #
 # gnome-session runs one session per systemd user instance: it refuses to
 # start while the instance's gnome-session-<type>@<session>.target
