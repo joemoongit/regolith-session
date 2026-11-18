@@ -1,0 +1,117 @@
+#!/bin/bash
+# regolith-session-nested <session> [gnome-session arguments...]
+#
+# Run a Regolith session for a user who already has one: another login at
+# the display manager (LightDM starts one if the session's .desktop file has
+# X-LightDM-Allow-Multiple-Sessions=true), on another seat or over XDMCP.
+# regolith-session-x11-launch runs it.
+#
+# gnome-session runs one session per systemd user instance: the user's
+# instance holds one environment (DISPLAY, ...), and the session's services
+# (gnome-settings-daemon, GNOME Flashback, the window manager, the
+# compositor) run once in it. So this session gets a systemd user instance of
+# its own: a "systemd --user" running as a delegated service of the user's
+# main instance, with its own runtime directory, and so its own D-Bus session
+# bus and environment. gnome-session then runs in it as usual.
+#
+# Per-user services that must run once (audio, SSH agents) and the settings
+# database stay with the main instance: their sockets are linked into the
+# session's runtime directory and their units are masked in the nested
+# instance, together with timers.target and paths.target, so that the user's
+# timers don't run once per session. The keyring daemon runs once per
+# instance, as it did once per session before systemd user instances: its
+# Secret Service has to be on the session's bus.
+#
+# The nested instance starts with the environment of the main one, which
+# belongs to the first session: everything but what systemd sets for a user
+# instance is unset there, and gnome-session uploads this session's
+# environment as usual.
+#
+# If the nested instance does not start, fall back to a secondary session:
+# i3 on its own D-Bus session bus, without gnome-session and the services it
+# manages (GNOME Flashback, gnome-settings-daemon). REGOLITH_SESSION_SECONDARY
+# tells the session to leave the user's systemd instance alone, as it belongs
+# to the first session.
+
+set -Eeu -o pipefail
+
+session=$1
+shift
+
+main_runtime=${XDG_RUNTIME_DIR:?}
+id=${XDG_SESSION_ID:-$$}
+dir=$main_runtime/regolith/session-$id
+unit=regolith-session-$id.service
+
+# Shared with the user's main systemd instance, see above
+shared_entries="pipewire-0 pipewire-0-manager gcr openssh_agent dconf"
+masked_units="timers.target paths.target
+    pipewire.socket pipewire.service pipewire-pulse.socket pipewire-pulse.service
+    wireplumber.service filter-chain.service mpris-proxy.service
+    gcr-ssh-agent.socket gcr-ssh-agent.service ssh-agent.socket ssh-agent.service"
+
+systemd_binary=/usr/lib/systemd/systemd
+[ -x "$systemd_binary" ] || systemd_binary=/lib/systemd/systemd
+
+fallback() {
+    echo "Could not start a systemd user instance for this session, starting a secondary session" >&2
+    cleanup
+    export REGOLITH_SESSION_SECONDARY=1
+    exec dbus-run-session -- /usr/bin/regolith-session-x11
+}
+
+cleanup() {
+    XDG_RUNTIME_DIR=$main_runtime systemctl --user stop "$unit" 2>/dev/null || :
+    [ -d "$dir" ] || return 0
+    # systemd leaves read-only directories behind (systemd/inaccessible)
+    find "$dir" -xdev -type d ! -perm -u=rwx -exec chmod u+rwx {} + 2>/dev/null || :
+    rm -rf --one-file-system "$dir"
+}
+
+# A directory left by an earlier session with the same ID
+cleanup
+mkdir -p -m 700 "$main_runtime/regolith"
+mkdir -m 700 "$dir"
+
+# The settings database tells its clients about changes through a file in
+# the runtime directory, so it has to exist before it is linked
+mkdir -p -m 700 "$main_runtime/dconf"
+for entry in $shared_entries; do
+    ln -s "$main_runtime/$entry" "$dir/$entry"
+done
+# PulseAudio clients want a directory of their own, not a link
+mkdir -m 700 "$dir/pulse"
+ln -s "$main_runtime/pulse/native" "$dir/pulse/native"
+
+# Runtime masks of the nested instance ($XDG_RUNTIME_DIR/systemd/user)
+mkdir -p "$dir/systemd/user"
+for masked in $masked_units; do
+    ln -s /dev/null "$dir/systemd/user/$masked"
+done
+
+inherited=$(XDG_RUNTIME_DIR=$main_runtime systemctl --user show-environment |
+    sed -n 's/=.*//p' | grep -vxE 'HOME|LANG|LANGUAGE|LC_[A-Z_]+|LOGNAME|PATH|SHELL|USER|XDG_RUNTIME_DIR' |
+    tr '\n' ' ') || inherited=
+
+if ! XDG_RUNTIME_DIR=$main_runtime systemd-run --user --quiet \
+        --unit="$unit" \
+        --description="Regolith session $id" \
+        --property=Type=notify \
+        --property=Delegate=yes \
+        --property=CollectMode=inactive-or-failed \
+        --property=UnsetEnvironment="$inherited" \
+        --setenv=XDG_RUNTIME_DIR="$dir" \
+        --setenv=DBUS_SESSION_BUS_ADDRESS="unix:path=$dir/bus" \
+        "$systemd_binary" --user --unit=regolith-nested-session.target; then
+    fallback
+fi
+
+trap cleanup EXIT
+trap 'exit 143' TERM
+trap 'exit 130' INT
+trap 'exit 129' HUP
+
+export XDG_RUNTIME_DIR=$dir
+export DBUS_SESSION_BUS_ADDRESS=unix:path=$dir/bus
+echo "Starting session $session in the systemd user instance $unit ($dir)" >&2
+gnome-session --session="$session" "$@"

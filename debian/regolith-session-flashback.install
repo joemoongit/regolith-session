@@ -5,6 +5,8 @@ usr/bin/regolith-session-x11-launch
 usr/bin/regolith-session-x11
 usr/lib/regolith/regolith-session-x11-state.sh
 usr/lib/regolith/xsession
+usr/lib/regolith/regolith-session-nested
+usr/lib/systemd/user/regolith-nested-session.target
 etc/X11/Xsession.d/19regolith-session-x11
 usr/lib/systemd/user/regolith-x11.service
 usr/lib/systemd/user/regolith-x11-failed.service

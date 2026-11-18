@@ -1,0 +1,7 @@
+# The unit that the systemd user instance of a nested Regolith session boots
+# into, see /usr/lib/regolith/regolith-session-nested. It only provides the
+# session's D-Bus bus; gnome-session starts the session's services.
+[Unit]
+Description=Regolith session in its own systemd user instance
+Wants=dbus.socket
+After=dbus.socket

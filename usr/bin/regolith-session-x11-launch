@@ -45,26 +45,23 @@ fi
 # would show the greeter again.
 # shellcheck source=../lib/regolith/regolith-session-x11-state.sh
 source /usr/lib/regolith/regolith-session-x11-state.sh
-start_secondary_session() {
-    # i3 on its own D-Bus session bus, without gnome-session and the services
-    # it manages (GNOME Flashback, gnome-settings-daemon).
-    # REGOLITH_SESSION_SECONDARY tells the session to leave the user's systemd
-    # instance alone, as it belongs to the first session.
-    export REGOLITH_SESSION_SECONDARY=1
-    exec dbus-run-session -- /usr/bin/regolith-session-x11
+start_nested_session() {
+    # Run this session in a systemd user instance of its own, see
+    # regolith-session-nested
+    exec /usr/lib/regolith/regolith-session-nested $SESSION_TYPE --disable-acceleration-check "$@"
 }
 if regolith_session_target_active; then
     if regolith_session_leader_running; then
-        echo "A Regolith X11 session is already running for ${USER:-$(id -un)}, starting a secondary session" >&2
-        start_secondary_session
+        echo "A Regolith X11 session is already running for ${USER:-$(id -un)}, starting another one" >&2
+        start_nested_session "$@"
     fi
     # The session ended, but its targets are still active, for example because
     # its leader was killed before it could stop them; gnome-session would
     # refuse to start until they are stopped
     echo "Stopping what is left of an earlier session" >&2
     if ! regolith_session_stop_stale; then
-        echo "Could not stop the earlier session, starting a secondary session" >&2
-        start_secondary_session
+        echo "Could not stop the earlier session, starting another one" >&2
+        start_nested_session "$@"
     fi
 fi
 
