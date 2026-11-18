@@ -39,8 +39,11 @@ session_vars="DISPLAY|XAUTHORITY|WAYLAND_DISPLAY|XDG_SESSION_ID|XDG_VTNR|XDG_SEA
 XDG_SESSION_TYPE|XDG_SESSION_CLASS|XDG_SESSION_DESKTOP|XDG_CURRENT_DESKTOP|\
 DESKTOP_SESSION|GDMSESSION"
 
+# log goes to the journal as well as stderr, which display managers send to
+# ~/.xsession-errors.
 log() {
     echo "regolith-session-return: $*" >&2
+    logger -t regolith-session-return -- "$*" 2> /dev/null || true
 }
 
 # session_props <id> prints the logind properties of a session as
@@ -124,7 +127,9 @@ session_environment() {
     procs="$cgroup_root/user.slice/user-$(id -u).slice/session-$id.scope/cgroup.procs"
     if [ -r "$procs" ]; then
         while read -r pid; do
-            env=$(tr '\0' '\n' < "$proc/$pid/environ" 2>/dev/null) || continue
+            # Processes of other users in the session, such as the display
+            # manager's session child, aren't readable: skip them quietly.
+            env=$(tr '\0' '\n' 2> /dev/null < "$proc/$pid/environ") || continue
             if grep -Eq '^(DISPLAY|WAYLAND_DISPLAY)=' <<< "$env"; then
                 grep -E "^($session_vars)=" <<< "$env" || true
                 return 0

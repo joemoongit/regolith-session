@@ -88,6 +88,10 @@ cat > "$T/bin/dbus-update-activation-environment" <<'EOF'
 #!/bin/bash
 echo "d-u-a-e $*" >> "$STATE/log"
 EOF
+cat > "$T/bin/logger" <<'EOF'
+#!/bin/bash
+echo "logger $*" >> "$STATE/log"
+EOF
 cat > "$T/bin/gnome-session" <<'EOF'
 #!/bin/bash
 echo "gnome-session $*" >> "$STATE/log"
@@ -160,12 +164,16 @@ run_helper() {
 }
 
 logged() { grep -qF -- "$1" "$STATE/log"; }
+not_grep() { ! grep -q "$@"; }
 not_logged() { ! logged "$1"; }
 
 ### A session still running on VT 7
 new_state
 add_session c1 x11 online seat0 7 no regolith-x11
 x_server 7; x_server 8
+# The display manager's session child comes first and can't be read.
+mkdir -p "$STATE/fakeroot/cgroup/user.slice/user-$UID_.slice/session-c1.scope"
+echo 1200 > "$STATE/fakeroot/cgroup/user.slice/user-$UID_.slice/session-c1.scope/cgroup.procs"
 add_process c1 1201 DISPLAY=:0 XAUTHORITY=/home/u/.Xauthority XDG_SESSION_ID=c1 XDG_VTNR=7 HOME=/home/u
 export BACK_AFTER=3
 run_helper
@@ -177,6 +185,8 @@ check "running session: gives the user manager its environment back" \
 check "running session: only the session variables" not_logged "HOME=/home/u"
 check "running session: waits until the user comes back to this VT" [ "$(cat "$STATE/sleeps")" = 3 ]
 check "running session: leaves the user manager's session alone" not_logged "gnome-session-ctl"
+check "running session: no error for the unreadable process" not_grep "Permission denied\|No such file" "$STATE/out"
+check "running session: logs to the journal" logged "logger -t regolith-session-return -- returning to the running session c1"
 
 ### ... and that session ends while this login waits
 new_state
